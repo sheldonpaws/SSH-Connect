@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hermes Agent — SSH Connect</title>
+    <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+    <link rel="icon" href="/static/favicon.ico" type="image/x-icon">
+    <link rel="stylesheet" href="/static/css/style.css?v=26">
+    <link rel="stylesheet" href="/static/css/hermes.css?v=26">
+</head>
+<body>
+
+    <!-- Верхняя панель -->
+    <header id="toolbar">
+        <div class="brand">⚕ Hermes Agent</div>
+        <a id="back-link" class="nav-link" href="/">← Файлы</a>
+        <div class="tools">
+            <span id="hermes-session-label" class="dim"></span>
+            <span id="config-summary" class="toolbar-summary" title="Модель меняется через `hermes model` в терминале (KiTTY)"></span>
+            <span id="pacer-ind" class="pacer-ind" title="Пейсер-прокси: проверка…">⚪</span>
+            <span id="status-text">Подключение...</span>
+        </div>
+    </header>
+
+    <main id="hermes-app">
+
+        <!-- Боковая панель -->
+        <aside id="side-panel">
+            <button id="new-chat-btn" title="Начать новую сессию агента">＋ Новый чат</button>
+
+            <details class="side-section">
+                <summary class="side-title">Сессии <button id="reload-sessions" title="Обновить">⟳</button></summary>
+                <div id="sessions-list" class="side-list"><div class="side-empty">Пока нет сессий</div></div>
+            </details>
+
+            <details class="side-section">
+                <summary class="side-title">Скиллы <button id="reload-skills" title="Обновить">⟳</button></summary>
+                <div id="skills-list" class="side-list"><div class="side-empty">Загрузка...</div></div>
+                <div class="side-hint">Отмеченные скиллы передаются агенту (-s)</div>
+            </details>
+
+            <details class="side-section">
+                <summary class="side-title">Задачи <button id="reload-jobs" title="Обновить">⟳</button></summary>
+                <div id="jobs-list" class="side-list"><div class="side-empty">Загрузка…</div></div>
+                <div class="side-hint">Фоновые задачи агента. Продолжаются на сервере даже после закрытия вкладки.</div>
+            </details>
+
+            <details class="side-section">
+                <summary class="side-title">Документы <button id="reload-docs" title="Обновить">⟳</button></summary>
+                <div id="docs-list" class="side-list"><div class="side-empty">Загрузка…</div></div>
+                <div class="side-hint">Файлы в ~/.hermes/cache/documents — открыть в редакторе</div>
+            </details>
+
+            <details class="side-section">
+                <summary class="side-title">Рабочие <button id="reload-work" title="Обновить">⟳</button></summary>
+                <div id="work-list" class="side-list"><div class="side-empty">Загрузка…</div></div>
+                <div class="side-hint">папки ~/drafts, ~/ink, ~/projects</div>
+            </details>
+
+            <details class="side-section">
+                <summary class="side-title">Медиа <button id="reload-media" title="Обновить">⟳</button></summary>
+                <div id="media-list" class="side-list"><div class="side-empty">Загрузка…</div></div>
+                <div class="side-hint">картинки и скриншоты из ~/.hermes/cache</div>
+            </details>
+
+            <details class="side-section">
+                <summary class="side-title">Промпты <button id="reload-prompts" title="Обновить">⟳</button></summary>
+                <div id="prompts-list" class="side-list"><div class="side-empty">Загрузка…</div></div>
+                <div class="side-hint">Файлы памяти ~/.hermes/memories — открыть/отправить в чат</div>
+            </details>
+
+            <details class="side-section">
+                <summary class="side-title">Журнал <button id="reload-log" title="Обновить">⟳</button></summary>
+                <pre id="log-view" class="side-log"><div class="side-empty">Загрузка…</div></pre>
+                <div class="side-hint">хвост ~/.hermes/logs/agent.log</div>
+            </details>
+
+            <details class="side-section">
+                <summary class="side-title side-title-center">Память</summary>
+                <button class="mem-btn" data-file="SOUL.md">SOUL.md — личность</button>
+                <button class="mem-btn" data-file="MEMORY.md">MEMORY.md — память</button>
+                <button class="mem-btn" data-file="USER.md">USER.md — профиль</button>
+                <button class="mem-btn" data-file="config.yaml">config.yaml — настройки</button>
+            </details>
+        </aside>
+
+        <!-- Чат -->
+        <section id="chat-panel">
+            <div id="chat-log"></div>
+
+            <div id="chat-controls">
+                <label class="chk"><input type="checkbox" id="yolo-chk"> YOLO (авто-подтверждение команд)</label>
+                <span id="skills-hint" class="dim"></span>
+            </div>
+
+            <div id="input-row">
+                <textarea id="chat-input" rows="2" placeholder="Сообщение агенту…  Enter — новая строка, Ctrl+Enter — отправить"></textarea>
+                <button id="send-btn" title="Отправить">➤</button>
+                <button id="stop-btn" class="hidden" title="Прервать">■</button>
+            </div>
+        </section>
+    </main>
+
+    <!-- Редактор файла -->
+    <div id="editor-modal" class="modal hidden">
+        <div class="modal-box">
+            <div class="modal-head">
+                <span id="editor-title">Файл</span>
+                <button id="editor-close" title="Закрыть">✕</button>
+            </div>
+            <textarea id="editor-content" spellcheck="false"></textarea>
+            <div class="modal-foot">
+                <button id="editor-save">💾 Сохранить</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Hermes не установлен -->
+    <div id="not-installed" class="hidden">
+        <div class="ni-box">
+            <div class="ni-icon">⚕</div>
+            <h2>Hermes Agent не установлен</h2>
+            <p id="ni-text">Для этого пользователя на сервере нет каталога ~/.hermes.</p>
+            <p>Установите агент вручную по SSH (в KiTTY или терминале):<br>
+                <code>curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash</code></p>
+        </div>
+    </div>
+
+    <!-- Подсказка/статус -->
+    <div id="toast" class="hidden"></div>
+
+    <script src="/static/js/hermes.js?v=26"></script>
+</body>
+</html>

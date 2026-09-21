@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SSH Connect</title>
+    <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+    <link rel="icon" href="/static/favicon.ico" type="image/x-icon">
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+
+    <!-- Верхняя панель -->
+    <header id="toolbar">
+        <div class="brand">🐶 SSH Connect</div>
+
+        <div class="path-bar">
+            <input id="path-input" type="text" value="/" spellcheck="false">
+            <button id="go-btn" title="Перейти">➡</button>
+            <button id="refresh-btn" title="Обновить">⟳</button>
+            <button id="up-btn" title="Вверх">⬆</button>
+        </div>
+
+        <div class="tools">
+            <a id="hermes-link" class="nav-link" href="/hermes" title="Чат с Hermes Agent">⚕ Hermes</a>
+            <div id="programs-wrap" class="dropdown">
+                <button id="programs-btn" title="Запустить в KiTTY">▸ Программы</button>
+                <div id="programs-menu" class="dropdown-menu hidden">
+                    <div class="dropdown-title">Запустить в KiTTY</div>
+                    <div id="programs-list"></div>
+                </div>
+            </div>
+
+            <button id="upload-btn" title="Загрузить файлы на сервер">⬆</button>
+            <button id="upload-dir-btn" title="Загрузить папку на сервер">📁⬆</button>
+            <button id="new-folder-btn" title="Новая папка">📁+</button>
+            <button id="download-btn" title="Скачать выбранное">⬇</button>
+            <button id="rename-btn" title="Переименовать">✏️</button>
+            <button id="delete-btn" title="Удалить">🗑️</button>
+            <input id="file-input" type="file" multiple class="hidden">
+            <input id="dir-input" type="file" webkitdirectory class="hidden">
+            <span id="status-text">Подключение...</span>
+        </div>
+    </header>
+
+    <!-- Файловый менеджер -->
+    <main id="workspace">
+        <section id="file-panel">
+            <div id="file-list" class="file-list"></div>
+        </section>
+    </main>
+
+    <!-- Редактор файла -->
+    <div id="editor-modal" class="modal hidden">
+        <div class="modal-box">
+            <div class="modal-head">
+                <span id="editor-title">Файл</span>
+                <button id="editor-close" title="Закрыть">✕</button>
+            </div>
+            <textarea id="editor-content" spellcheck="false"></textarea>
+            <div class="modal-foot">
+                <button id="editor-save">💾 Сохранить</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Подсказка/статус -->
+    <div id="toast" class="hidden"></div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

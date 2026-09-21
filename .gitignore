@@ -216,3 +216,22 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# SSH-Connect runtime data (secrets and per-machine state)
+ssh_connections.json
+last_profile.txt
+.encryption_key
+Downloads/
+Sessions/
+SshHostKeys/
+web-desktop/backend/.server_token
+web-desktop/backend/server.log
+web-desktop/backend/server.log.err
+ошибки.txt
+
+# Per-machine runtime/state (auto-created, never push)
+PUTTY.RND
+move_cursor.json
+move_cursor.log
+tunnel_config.json
+TUNNEL_LOG.md
