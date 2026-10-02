@@ -14,10 +14,18 @@
 
 import os
 import sys
+import tempfile
 
 TESTS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(TESTS)
 BACKEND = os.path.join(ROOT, "web-desktop", "backend")
+
+# Тесты пишут runtime-файлы (ssh_connections.json, known_hosts, move_cursor.*)
+# во временную папку пользователя, а не в репозиторий.
+os.environ.setdefault(
+    "SSH_CONNECT_USER_DATA",
+    tempfile.mkdtemp(prefix="sshconnect_user_data_"),
+)
 
 for _p in (TESTS, ROOT, BACKEND):
     if _p not in sys.path:

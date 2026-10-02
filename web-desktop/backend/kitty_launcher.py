@@ -15,34 +15,50 @@ WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
 
 
-def find_kitty_window() -> int | None:
-    """Найти видимое окно KiTTY"""
+def find_kitty_window(hostname: str | None = None) -> int | None:
+    """Найти видимое окно KiTTY.
+
+    Приоритет: окно, в заголовке которого есть hostname подключения (чтобы
+    команда не улетела в чужое окно KiTTY, открытое вручную); если hostname
+    не задан — первое видимое окно класса "KiTTY".
+    """
     user32 = ctypes.windll.user32
     EnumWindowsProc = ctypes.WINFUNCTYPE(
         ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p
     )
     result = [None]
+    fallback = [None]
 
     def callback(hwnd, lParam):
-        if user32.IsWindowVisible(hwnd):
-            class_name = ctypes.create_unicode_buffer(256)
-            user32.GetClassNameW(hwnd, class_name, 256)
-            if class_name.value == "KiTTY":
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        class_name = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, class_name, 256)
+        if class_name.value != "KiTTY":
+            return True
+        if hostname:
+            title = ctypes.create_unicode_buffer(512)
+            user32.GetWindowTextW(hwnd, title, 512)
+            if hostname.lower() in title.value.lower():
                 result[0] = hwnd
                 return False
+        if fallback[0] is None:
+            fallback[0] = hwnd
         return True
 
     proc = EnumWindowsProc(callback)
     user32.EnumWindows(proc, 0)
-    return result[0]
+    return result[0] if result[0] is not None else fallback[0]
 
 
-def send_command(command: str) -> tuple[bool, str]:
+def send_command(command: str, hostname: str | None = None) -> tuple[bool, str]:
     """Отправить команду в окно KiTTY через PostMessage WM_CHAR.
 
-    Команда отправляется посимвольно + Enter. Возвращает (успех, сообщение).
+    Команда отправляется посимвольно + Enter. hostname — чтобы найти именно
+    окно нужного подключения (иначе любое окно KiTTY).
+    Возвращает (успех, сообщение).
     """
-    hwnd = find_kitty_window()
+    hwnd = find_kitty_window(hostname) if hostname else find_kitty_window()
     if not hwnd:
         return False, "Окно KiTTY не найдено"
 

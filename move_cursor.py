@@ -13,8 +13,11 @@ ctypes: нажатия PgUp/PgDn глотаются, пока активное �
 
 Настройки — в move_cursor.json рядом со скриптом (создаётся сам).
 Журнал действий — move_cursor.log.
+Если запущено с флагом --data-dir <папка>, настройки и журнал лежат там
+(папка пользователя программы, user_data).
 """
 
+import argparse
 import ctypes
 import ctypes.wintypes as wintypes
 import json
@@ -86,6 +89,14 @@ class KBDLLHOOKSTRUCT(ctypes.Structure):
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "move_cursor.json")
 LOG_FILE = os.path.join(SCRIPT_DIR, "move_cursor.log")
+
+
+def _set_data_dir(data_dir: str):
+    """Перенаправить настройки/журнал в папку пользователя (--data-dir)."""
+    global CONFIG_FILE, LOG_FILE
+    os.makedirs(data_dir, exist_ok=True)
+    CONFIG_FILE = os.path.join(data_dir, "move_cursor.json")
+    LOG_FILE = os.path.join(data_dir, "move_cursor.log")
 
 DEFAULTS = {
     "pause_key": "f12",
@@ -257,6 +268,15 @@ class Scroller:
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        prog="move_cursor",
+        description="PgUp/PgDn → колесо мыши для KiTTY/tmux")
+    parser.add_argument("--data-dir", default=None, metavar="DIR",
+                        help="папка для move_cursor.json и move_cursor.log "
+                             "(по умолчанию — рядом со скриптом)")
+    args = parser.parse_args()
+    if args.data_dir:
+        _set_data_dir(args.data_dir)
     cfg = _load_config()
     Scroller(cfg).start()
 

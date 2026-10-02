@@ -56,6 +56,15 @@ class SSHClient:
                 transport.set_keepalive(30)
             return True, "Подключение успешно!"
 
+        except paramiko.ssh_exception.BadHostKeyException as e:
+            return False, (
+                f"⚠️ Host-key для {e.hostname} изменился "
+                f"(сервер прислал {e.key.get_name()})."
+                "\nВозможна подмена сервера (MITM-атака) или его "
+                "переустановка — соединение отклонено.\n"
+                "Чтобы подключиться заново, удалите старый ключ сервера "
+                "из known_hosts (папка user_data/SshHostKeys)."
+            )
         except Exception as e:
             return False, str(e)
 

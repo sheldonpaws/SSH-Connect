@@ -17,7 +17,6 @@ class TestHostKeys(unittest.TestCase):
         path = hostkeys.get_known_hosts_path()
         self.assertTrue(path.replace("\\", "/").endswith("SshHostKeys/known_hosts"))
         self.assertTrue(os.path.isdir(os.path.dirname(path)))
-        self.assertTrue(os.path.exists(path))
 
     def test_policy_adds_key_and_saves(self):
         client = FakeParamikoClient()
@@ -52,6 +51,24 @@ class TestHostKeys(unittest.TestCase):
         hostkeys.prepare_host_keys(client, on_warning=seen.append)
         client.policy.missing_host_key(client, "h", FakeKey())
         self.assertEqual(len(seen), 1)
+
+    def test_hostkey_blob_returns_type_and_b64(self):
+        path = hostkeys.get_known_hosts_path()
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("example.com ssh-ed25519 AAAAZmFrZWtleQo9 ==plain\n")
+            f.write("[other.com]:2222 ssh-rsa BBBB\n")
+        self.assertEqual(hostkeys.get_hostkey_blob("example.com", 22),
+                         "ssh-ed25519 AAAAZmFrZWtleQo9")
+        self.assertEqual(hostkeys.get_hostkey_blob("other.com", 2222),
+                         "ssh-rsa BBBB")
+        self.assertIsNone(hostkeys.get_hostkey_blob("unknown", 22))
+
+    def test_hostkey_blob_ignores_hashed_lines(self):
+        path = hostkeys.get_known_hosts_path()
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("|1|abc ssh-ed25519 XXXX\n")
+            f.write("# comment\n")
+        self.assertIsNone(hostkeys.get_hostkey_blob("example.com", 22))
 
 
 if __name__ == "__main__":

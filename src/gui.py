@@ -31,15 +31,18 @@ import tkinter as tk
 from tkinter import ttk, filedialog
 from datetime import datetime
 
+from src import paths
 from src.clipboard_sync import ClipboardSyncThread
 from src.hermes_skills import install_skill_if_missing
 from src.reverse_access import ReverseAccess, make_slug
 from src.ssh import SSHClient
 from src.utils import load_connections, save_connections
+from src.hostkeys import get_hostkey_blob
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CONNECTIONS_FILE = os.path.join(PROJECT_ROOT, "ssh_connections.json")
-LAST_PROFILE_FILE = os.path.join(PROJECT_ROOT, "last_profile.txt")
+PROJECT_ROOT = paths.project_root()
+CONNECTIONS_FILE = paths.user_data_path("ssh_connections.json")
+LAST_PROFILE_FILE = paths.user_data_path("last_profile.txt")
+USER_DATA_DIR = paths.user_data_dir()
 KITTY_EXE = os.path.join(PROJECT_ROOT, "kitty.exe")
 KITTY_LOG_FILE = os.path.join(tempfile.gettempdir(), "kitty_session.log")
 BACKEND_DIR = os.path.join(PROJECT_ROOT, "web-desktop", "backend")
@@ -74,7 +77,8 @@ class KittyController:
     Пароль и команды отправляются посредством PostMessage WM_CHAR — работает
     даже со свёрнутым окном и никогда не попадает в командную строку
     (зеркально original + web-desktop/backend/kitty_launcher.py). Сессионный
-    лог %TEMP%\\kitty_session.log отслеживается, чтобы найти приглашение
+    лог (%TEMP%\\kitty_session.log, а для дополнительных окон —
+    %TEMP%\\kitty_session_<N>.log) отслеживается, чтобы найти приглашение
     пароля и поймать ошибку авторизации.
     """
 
@@ -82,8 +86,28 @@ class KittyController:
         self.on_log = on_log or (lambda msg, level="info": None)
         self.process = None
         self.hwnd = None
+        self._hostname = None
         self._stop_event = threading.Event()
         self._user32 = ctypes.windll.user32
+        self.log_file = KITTY_LOG_FILE
+        self.name = None  # подпись окна в GUI («Окно 1», …)
+        self.slot = 1     # номер слота окна (1 — основное, 2..5 — доп.)
+        # Готово ли окно принимать команды. Свежеоткрытое окно ещё
+        # проходит вход по SSH (ввод пароля, баннер) — команда, отправленная
+        # в этот момент, просто теряется, поэтому её ставят в очередь.
+        self._ready = threading.Event()
+        self._started_at = time.time()
+        self._password_at = None
+        self._last_log_change = time.time()
+        self._tail = ""
+        self._password_queued = ""
+        self._password_sent = False
+        self._denied_reported = False
+        self._prompt_wait_started = time.time()
+        # Находимся ли мы внутри tmux в этом окне: False — окно открыто,
+        # tmux не запускали (нужен attach), True — уже внутри сессии
+        # (нужен switch-client), None — неизвестно (терминал решит сам).
+        self.in_tmux = False
 
     def _log(self, msg, level="info"):
         try:
@@ -92,8 +116,18 @@ class KittyController:
             pass
 
     def find_kitty_window(self, pid=None):
-        """Найти видимое окно с классом "KiTTY" (опционально по PID процесса)."""
+        """Найти видимое окно с классом "KiTTY".
+
+        Приоритет: (1) если есть наш процесс — строго по PID (чтобы не
+        угнать чужое окно KiTTY, открытое вручную; в этом режиме на другие
+        окна НЕ откатываемся), (2) без PID — по заголовку окна, содержащему
+        hostname подключения, (3) любое окно класса "KiTTY".
+        """
+        pid = pid if pid is not None else (
+            self.process.pid if self.process is not None else None)
         result = [None]
+        fallback = [None]
+        win_pid = wintypes.DWORD()
         EnumWindowsProc = ctypes.WINFUNCTYPE(
             ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p
         )
@@ -105,22 +139,45 @@ class KittyController:
             self._user32.GetClassNameW(hwnd, buf, 256)
             if buf.value != "KiTTY":
                 return True
-            if pid:
-                pd = wintypes.DWORD()
-                self._user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pd))
-                if pd.value != pid:
-                    return True
-            result[0] = hwnd
-            return False
+            self._user32.GetWindowThreadProcessId(
+                hwnd, ctypes.byref(win_pid))
+            if pid is None:
+                # нет своего процесса: точный заголовок важнее «любого окна»
+                title = ctypes.create_unicode_buffer(512)
+                self._user32.GetWindowTextW(hwnd, title, 512)
+                if self._hostname and \
+                        self._hostname.lower() in title.value.lower():
+                    result[0] = hwnd
+                    return False
+                if fallback[0] is None:
+                    fallback[0] = hwnd
+                return True
+            if win_pid.value == pid:
+                result[0] = hwnd
+                return False
+            return True
 
         proc = EnumWindowsProc(callback)
         self._user32.EnumWindows(proc, 0)
-        self.hwnd = result[0]
+        hwnd = result[0] if result[0] is not None else fallback[0]
+        self.hwnd = hwnd
+        return self.hwnd
+
+    def _find_hwnd(self):
+        """Актуальный hwnd окна KiTTY (с проверкой, что он ещё живой).
+
+        Кэш используется только если окно существует; иначе ищем заново:
+        при живом процессе — строго по PID, иначе по заголовку/классу.
+        """
+        if self.hwnd and self._user32.IsWindow(self.hwnd):
+            return self.hwnd
+        self.hwnd = None
+        self.find_kitty_window()
         return self.hwnd
 
     def minimize_window(self):
         """Свернуть окно KiTTY (PostMessage работает и со свёрнутым окном)."""
-        hwnd = self.hwnd or self.find_kitty_window()
+        hwnd = self._find_hwnd()
         if hwnd:
             try:
                 self._user32.ShowWindow(hwnd, SW_MINIMIZE)
@@ -138,7 +195,7 @@ class KittyController:
         RESTORE_RAISE px выше верха главного окна. z-order не трогаем —
         окно остаётся там, где оно есть (обычно поверх главного).
         """
-        hwnd = self.hwnd or self.find_kitty_window()
+        hwnd = self._find_hwnd()
         if not hwnd:
             return False
         try:
@@ -183,7 +240,7 @@ class KittyController:
 
         Возвращает (успех, сообщение). Работает и со свёрнутым окном.
         """
-        hwnd = self.hwnd or self.find_kitty_window()
+        hwnd = self._find_hwnd()
         if not hwnd:
             return False, "Окно KiTTY не найдено"
         if not self._user32.IsWindow(hwnd):
@@ -197,11 +254,16 @@ class KittyController:
             return False, str(e)
 
     def start_kitty_with_logging(self, hostname, port, username, password,
-                                 key_file=None):
+                                 key_file=None, hostkey=None, log_file=None):
         """Запустить kitty.exe с сессионным логом и фоном следить за ним.
 
         Аргументы передаются списком (без shell=True) — защита от cmd-инъекции
         через имя пользователя/хоста; сами значения строго валидируются.
+        `hostkey` — "<тип> <base64>" из known_hosts: передаётся в -hostkey,
+        чтобы KiTTY молча проверил ключ и НЕ показывал свой английский диалог
+        про host-key при первом подключении.
+        `log_file` — свой файл лога для этого окна (несколько окон KiTTY не
+        должны затирать лог друг друга).
         Возвращает (успех, сообщение).
         """
         if not _RE_HOST.match(hostname):
@@ -211,15 +273,20 @@ class KittyController:
         if not os.path.exists(KITTY_EXE):
             return False, "kitty.exe не найден в папке проекта"
 
+        self._hostname = hostname
+        self.log_file = log_file or KITTY_LOG_FILE
+
         # Свежий файл лога для каждой сессии
         try:
-            if os.path.exists(KITTY_LOG_FILE):
-                os.remove(KITTY_LOG_FILE)
+            if os.path.exists(self.log_file):
+                os.remove(self.log_file)
         except OSError:
             pass
 
         args = [KITTY_EXE, "-ssh", "{}@{}".format(username, hostname),
-                "-P", str(int(port)), "-log", KITTY_LOG_FILE]
+                "-P", str(int(port)), "-log", self.log_file]
+        if hostkey:
+            args += ["-hostkey", hostkey]
         if key_file:
             args += ["-i", key_file]
 
@@ -235,6 +302,11 @@ class KittyController:
         self._password_queued = password or ""
         self._password_sent = False
         self._denied_reported = False
+        self._ready.clear()
+        self._started_at = time.time()
+        self._password_at = None
+        self._last_log_change = time.time()
+        self._tail = ""
         self._prompt_wait_started = time.time()
         self._stop_event.clear()
         threading.Thread(
@@ -251,10 +323,24 @@ class KittyController:
 
     def close_window(self):
         """Закрыть окно KiTTY (WM_CLOSE)."""
-        hwnd = self.hwnd or self.find_kitty_window()
+        hwnd = self._find_hwnd()
         if hwnd and self._user32.IsWindow(hwnd):
             self._user32.PostMessageW(hwnd, 0x0010, 0, 0)
             self.hwnd = None
+
+    def terminate(self):
+        """Принудительно завершить процесс KiTTY, если он ещё жив."""
+        proc = self.process
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        except Exception:
+            pass
 
     # ------- фон -------
 
@@ -272,16 +358,23 @@ class KittyController:
                     minimized = True
 
             try:
-                size = os.path.getsize(KITTY_LOG_FILE)
+                size = os.path.getsize(self.log_file)
                 if size < seen:
                     seen = 0
                 if size > seen:
-                    with open(KITTY_LOG_FILE, "r", encoding="utf-8",
+                    with open(self.log_file, "r", encoding="utf-8",
                               errors="replace") as f:
                         f.seek(seen)
                         data = f.read()
                     seen = size
                     low = data.lower()
+                    self._last_log_change = time.time()
+                    self._tail = (self._tail + data)[-600:]
+
+                    # Окно готово принимать команды: пароль принят, а вывод
+                    # затих (оболочка ждёт ввода) — либо в логе уже видно
+                    # приглашение shell (вход по ключу, без пароля).
+                    self._check_ready()
 
                     # Приглашение пароля появилось в логе — вводим пароль
                     if (self._password_queued and not self._password_sent
@@ -315,11 +408,70 @@ class KittyController:
             except OSError:
                 pass
 
+            # Готовность окна проверяем каждый тик: если пароль не вводился
+            # (вход по ключу), приглашение shell может быть в хвосте лога.
+            self._check_ready()
+
+    # Приглашение оболочки в конце строки: «user@host:~$ », «root@host:~# ».
+    _SHELL_PROMPT_RE = re.compile(r"[\$#%>][ \t]*\r?\n?$")
+    READY_TIMEOUT = 25.0
+
+    def is_ready(self):
+        """Готово ли окно KiTTY принимать команды (вход завершён)."""
+        return self._ready.is_set()
+
+    def _check_ready(self):
+        """Отметить окно готовым, как только завершился вход по SSH.
+
+        Основной сигнал — пароль отправлен и вывод терминала затих: значит
+        оболочка уже напечатала приглашение и ждёт ввода. Для входа по ключу
+        (пароля нет) ориентируемся на приглашение shell в логе. Любая проверка
+        не сработала за READY_TIMEOUT — считаем окно готовым всё равно: лучше
+        отправить команду «вслепую», чем потерять её молча.
+        """
+        if self._ready.is_set():
+            return
+        now = time.time()
+        if now - self._started_at > self.READY_TIMEOUT:
+            self._ready.set()
+            return
+        if (self._password_sent and self._password_at
+                and now - self._password_at > 1.0
+                and now - self._last_log_change > 0.5):
+            self._ready.set()
+            return
+        if not self._password_queued and self._SHELL_PROMPT_RE.search(
+                self._tail or ""):
+            self._ready.set()
+
+    def queue_command(self, text, restore=False, timeout=None):
+        """Отправить команду, как только окно будет готово к вводу.
+
+        Нужно для свежеоткрытого окна: сразу после запуска идёт вход по SSH,
+        ввод пароля и загрузка баннера — команда, отправленная в этот момент,
+        теряется. Выполняется в отдельном потоке, UI не блокируется.
+        """
+        limit = self.READY_TIMEOUT if timeout is None else timeout
+
+        def worker():
+            if not self._ready.wait(limit):
+                # окно не отмечено готовым (нет приглашения shell) — небольшая
+                # пауза, чтобы допечатался баннер, и отправляем в любом случае
+                time.sleep(1.0)
+            try:
+                if restore:
+                    self.restore_window()
+                self.send_command(text)
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _send_password(self):
         """Ввести пароль в KiTTY через PostMessage (не зависит от фокуса)."""
         if not self._password_queued:
             return
-        hwnd = self.hwnd or self.find_kitty_window()
+        hwnd = self._find_hwnd()
         if not hwnd:
             return
         if not self._user32.IsWindow(hwnd):
@@ -329,6 +481,7 @@ class KittyController:
             self._post_text(hwnd, self._password_queued)
             self._post_enter(hwnd)
             self._password_sent = True
+            self._password_at = time.time()
             self._log("🔑 Пароль отправлен в KiTTY")
         except Exception as e:
             self._log("⚠️ Не удалось ввести пароль: {}".format(e), "error")
@@ -386,10 +539,103 @@ class Tooltip:
             self._tip_window = None
 
 
+# Блок установки docker + контейнера chrome (linuxserver/chrome, порт 3001):
+# печатается в KiTTY при ПЕРВОМ нажатии кнопки «Docker-браузер» на этом хосте,
+# дальше кнопка просто открывает браузер. Маркер «показывали» хранится в
+# user_data/docker_setup_done.json — блок не повторяется ни в этой сессии, ни
+# после перезапуска. Строки уходят в терминал по одной с Enter в конце, поэтому
+# многострочная конкатенация `\` здесь свёрнута в одну команду.
+DOCKER_SETUP_BLOCK = """\
+sudo apt update
+sudo apt install -y ca-certificates curl gnupg
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt update && sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+docker run -d --name=chrome -e PUID=1000 -e PGID=1000 -e TZ=Europe/Moscow -e LC_ALL=ru_RU.UTF-8 -p 3001:3001 -v /opt/chrome/config:/config --shm-size=1gb --restart unless-stopped lscr.io/linuxserver/chrome:latest
+"""
+
+
+# Проверка «уже установлено?» на САМОМ сервере. Локальный маркер
+# user_data/docker_setup_done.json теряется при переустановке программы
+# (новая версия = новая папка user_data), поэтому перед показом блока
+# установки спрашиваем у VPS: есть ли docker и контейнер 'chrome'. Так
+# блок не повторяется в каждой новой версии программы.
+DOCKER_BROWSER_READY = "DOCKER_BROWSER_READY"
+DOCKER_CHECK_COMMAND = (
+    "if command -v docker >/dev/null 2>&1 && "
+    "docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx chrome; "
+    "then echo " + DOCKER_BROWSER_READY + "; "
+    "else echo DOCKER_BROWSER_MISSING; fi"
+)
+
+
+def parse_docker_installed(output) -> bool:
+    """Установлен ли docker-браузер по ответу DOCKER_CHECK_COMMAND."""
+    return DOCKER_BROWSER_READY in (output or "")
+
+
+def _docker_setup_marker_path():
+    return paths.user_data_path("docker_setup_done.json")
+
+
+def docker_setup_done(hostname) -> bool:
+    """Показывался ли блок установки docker этому хосту (по файлу-маркеру)."""
+    try:
+        with open(_docker_setup_marker_path(), "r", encoding="utf-8") as f:
+            return hostname in json.load(f)
+    except Exception:
+        return False
+
+
+def mark_docker_setup_done(hostname):
+    """Запомнить, что блоку установки этот хост уже показывался."""
+    path = _docker_setup_marker_path()
+    try:
+        data = {}
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        data[hostname] = True
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+
+def build_tmux_attach_command(name, inside_tmux=None):
+    """Команда монтирования сессии tmux в окно терминала.
+
+    `inside_tmux` — что мы знаем про целевое окно:
+      * False — окно только что открыто, tmux в нём ещё не запускался:
+        нужен именно `attach`. `switch-client` здесь бессмысленен (клиента
+        нет), из-за чего цепочка `switch || attach || echo` раньше доходила
+        до эха «Нет сессии tmux» вместо подключения;
+      * True — окно по нашим данным внутри tmux: сначала `switch-client`,
+        но с проверкой $TMUX и откатом на `attach` — если пользователь
+        отсоединился вручную (Ctrl-b d), флаг устарел и команда сама
+        восстановится;
+      * None — состояние неизвестно: терминал выбирает сам по $TMUX.
+    Если сессия исчезла — печатаем русскую заглушку.
+    """
+    q = shlex.quote(name)
+    echo = " || echo 'Нет сессии tmux'"
+    if inside_tmux is False:
+        return "tmux attach -t {}{}".format(q, echo)
+    return ('[ -n "$TMUX" ] && tmux switch-client -t {q} 2>/dev/null '
+            "|| tmux attach -t {q} 2>/dev/null{e}").format(q=q, e=echo)
+
+
 class SSHApp:
     """Главное окно SSH-клиента. Внешний вид — палитра FangUnion."""
 
     TMUX_NO_SESSIONS = "Нет сессий"
+
+    # Окна KiTTY: 1 — основное (открывается при подключении, работает как
+    # раньше), 2..5 — четыре ДОПОЛНИТЕЛЬНЫХ окна. Список слотов фиксирован:
+    # он никогда не растёт, поэтому при каждом подключении в селекторе
+    # остаются ровно «Окно 2», «Окно 3», «Окно 4», «Окно 5».
+    EXTRA_WINDOW_SLOTS = (2, 3, 4, 5)
 
     REVERSE_JSON = "~/.hermes/reverse_access.json"
 
@@ -414,6 +660,7 @@ class SSHApp:
 
         self.ssh = None
         self._kitty = None
+        self._kitty_windows = {}  # слот окна KiTTY (1..5) -> KittyController
         self._connected = False
         self._last_creds = None
         self._clip_thread = None
@@ -423,11 +670,19 @@ class SSHApp:
         self._reverse_list = None   # Listbox в диалоге менеджера
         self._reverse_slugs = {}    # папка -> уже назначенный слаг (стабильность)
         self._move_cursor_proc = None  # процесс move_cursor (для убийства при выходе)
+        self._web_server_proc = None   # процесс uvicorn-бэкенда (для убийства при выходе)
+        self._server_log_fd = None     # файловый дескриптор server.log (закрывать при выходе)
         # Тихая установка скила Hermes 'reverse-ssh-tunnel' на VPS (в фоне,
         # не блокирует UI). Результат — в self._hermes_skill_state:
         # 'already_present' | 'installed' | 'hermes_missing'
         self._hermes_skill_state = 'hermes_missing'
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
+
+        # Папка пользователя (создаётся при первом запуске).
+        paths.ensure_user_data("SshHostKeys", "Sessions", "Downloads")
+        # В собранном exe — ярлык на рабочем столе (создаётся, если его нет,
+        # независимо от того, создал ли user_data ещё build.bat).
+        self._create_desktop_shortcut()
 
         self.connections_file = CONNECTIONS_FILE
         self.last_profile_file = LAST_PROFILE_FILE
@@ -573,7 +828,7 @@ class SSHApp:
     # ------------------------------------------------------------------ UI
 
     def _create_widgets(self):
-        # Шапка: заголовок раздела «Подключение» и ссылка на инструкции
+        # Шапка: заголовок раздела «Подключение» и ссылка на документацию
         # на одной строке (ссылка справа).
         header = tk.Frame(self.root, bg=self.PAL_BLACK_VELVET)
         header.pack(fill=tk.X, padx=10, pady=(5, 0))
@@ -583,7 +838,7 @@ class SSHApp:
                          font=("Georgia", 10, "bold"))
         title.pack(side=tk.LEFT)
 
-        link = tk.Label(header, text="Инструкции", foreground=self.PAL_GOLD,
+        link = tk.Label(header, text="Документация", foreground=self.PAL_GOLD,
                         cursor="hand2", background=self.PAL_BLACK_VELVET,
                         font=("Georgia", 10, "underline"))
         link.pack(side=tk.RIGHT)
@@ -714,6 +969,17 @@ class SSHApp:
                                         command=self._tmux_kill, width=9,
                                         state=tk.DISABLED)
         self.tmux_kill_btn.pack(side=tk.LEFT, padx=5)
+
+        # KiTTY: фиксированный выбор одного из 4 дополнительных окон.
+        # Список никогда не меняется — выбранный слот либо открывает окно,
+        # либо показывает уже открытое. Окно 1 (основное) в списке нет.
+        ttk.Label(tmux_frame, text="Окно:").pack(side=tk.LEFT, padx=(10, 0))
+        self.kitty_window_combo = ttk.Combobox(
+            tmux_frame, state="disabled", width=9,
+            values=[self._slot_label(s) for s in self.EXTRA_WINDOW_SLOTS])
+        self.kitty_window_combo.pack(side=tk.LEFT, padx=5)
+        self.kitty_window_combo.bind("<<ComboboxSelected>>",
+                                     self._on_kitty_window_select)
 
         # Заглушка в списке tmux до подключения
         self.tmux_session_combo["values"] = [self.TMUX_NO_SESSIONS]
@@ -1086,36 +1352,216 @@ class SSHApp:
             pass
 
     def _open_kitty(self):
-        """Открыть KiTTY с логированием для интерактивного терминала."""
+        """Открыть KiTTY с логированием для интерактивного терминала.
+
+        Окно 1 — основное: открывается при каждом подключении и работает как
+        раньше. Перед открытием закрываются окна, оставшиеся от прошлого
+        подключения (иначе они держат слоты занятыми и не закрываются).
+        """
+        self._close_kitty()
+        if self._launch_kitty_window(1):
+            self._start_move_cursor()
+
+    def _slot_label(self, slot):
+        return "Окно {}".format(slot)
+
+    def _free_kitty_slot(self):
+        """Номер первого свободного дополнительного окна (None — все заняты)."""
+        self._prune_kitty_windows()
+        for slot in self.EXTRA_WINDOW_SLOTS:
+            if slot not in self._kitty_windows:
+                return slot
+        return None
+
+    def _use_kitty_slot(self, slot):
+        """Открыть окно KiTTY для слота (или показать уже открытое).
+
+        Возвращает контроллер окна или None при ошибке запуска.
+        """
+        self._prune_kitty_windows()
+        kit = self._kitty_windows.get(slot)
+        if kit is None:
+            kit = self._launch_kitty_window(slot)
+            if kit is None:
+                return None
+        self._kitty = kit
+        try:
+            kit.restore_window()
+        except Exception:
+            pass
+        return kit
+
+    def _on_kitty_window_select(self, event=None):
+        """Выбор окна в списке «Окно: 2/3/4/5» — открыть его или показать."""
+        if not self._connected:
+            return
+        label = (self.kitty_window_combo.get() or "").strip()
+        for slot in self.EXTRA_WINDOW_SLOTS:
+            if label == self._slot_label(slot):
+                self._use_kitty_slot(slot)
+                return
+
+    def _launch_kitty_window(self, slot):
+        """Запустить окно KiTTY для конкретного слота (1..5).
+
+        Каждое окно — свой KittyController со своим pid и лог-файлом,
+        поэтому в них можно держать разные tmux-сессии. Слот занят/свободен
+        решает вызывающий (`_free_kitty_slot`), здесь только запуск.
+        """
         creds = self._last_creds
         if not creds:
-            return
-        kit = KittyController(on_log=self._log)
+            return None
+        kit = KittyController(on_log=self._queue_log)
+        log_file = KITTY_LOG_FILE if slot == 1 else os.path.join(
+            tempfile.gettempdir(), "kitty_session_{}.log".format(slot))
+        hostkey = get_hostkey_blob(creds["hostname"], int(creds["port"]))
         okk, mm = kit.start_kitty_with_logging(
             creds["hostname"], creds["port"], creds["username"],
-            creds["password"] or "", creds["key_file"])
-        if okk:
-            self._kitty = kit
-            self._start_move_cursor()
-        else:
+            creds["password"] or "", creds["key_file"], hostkey=hostkey,
+            log_file=log_file)
+        if not okk:
             self._log("⚠️ KiTTY: {}".format(mm), "error")
+            return None
+        kit.slot = slot
+        kit.name = self._slot_label(slot)
+        self._kitty_windows[slot] = kit
+        self._kitty = kit
+        self._log("🐱 {}: открыто {} (окон: {})".format(
+            creds["hostname"], kit.name, len(self._kitty_windows)), "info")
+        return kit
+
+    def _prune_kitty_windows(self):
+        """Забыть окна KiTTY, процесс которых уже завершился.
+
+        Prune только по известному состоянию: `process is None` (окно ещё не
+        запускалось / процесс недоступен) считаем живым, чтобы не отбросить
+        рабочее окно. Закрыл пользователь окно — слот снова свободен.
+        """
+        for slot, kit in list(self._kitty_windows.items()):
+            proc = getattr(kit, "process", None)
+            try:
+                exited = proc is not None and proc.poll() is not None
+            except Exception:
+                exited = False
+            if exited:
+                try:
+                    kit.stop_watcher()
+                except Exception:
+                    pass
+                del self._kitty_windows[slot]
+                self._log("🪟 {} закрыто — слот свободен".format(kit.name),
+                          "info")
+        if self._kitty is not None and self._kitty not in list(
+                self._kitty_windows.values()):
+            self._kitty = self._kitty_windows.get(1)
+
+    def _focused_kitty(self):
+        """Окно KiTTY, которое сейчас в фокусе (None — ни одного).
+
+        Активным считается то окно, с которым работает пользователь: кликнул
+        по нужному терминалу — туда и уходят команды.
+        """
+        try:
+            fg = ctypes.windll.user32.GetForegroundWindow()
+        except Exception:
+            return None
+        if not fg:
+            return None
+        for kit in self._kitty_windows.values():
+            try:
+                hwnd = kit.find_kitty_window()
+            except Exception:
+                continue
+            if hwnd and hwnd == fg:
+                return kit
+        return None
+
+    def _active_kitty(self):
+        """Окно-получатель команд.
+
+        Приоритет: 1) окно в фокусе Windows (с ним работает пользователь),
+        2) окно, выбранное в списке «Окно:» / последнее открытое — чтобы
+        выбор окна работал и после клика на комбобокс сессий tmux,
+        3) основное окно 1.
+        """
+        self._prune_kitty_windows()
+        kit = self._focused_kitty()
+        if kit is not None:
+            self._kitty = kit
+        elif self._kitty not in list(self._kitty_windows.values()):
+            self._kitty = self._kitty_windows.get(1)
+        return self._kitty
+
+    def _create_desktop_shortcut(self):
+        """Создать ярлык на рабочем столе в собранном exe.
+
+        Best-effort: ошибки молча игнорируются; существующий ярлык не трогаем.
+        Вызывается при каждом запуске, но сам ярлык создаётся только один раз
+        (если `SSH-Connect.lnk` уже есть — poweshell сразу выходит).
+        Ярлык указывает на саму программу (иконка берётся из exe).
+        """
+        if not getattr(sys, "frozen", False):
+            return
+        try:
+            exe = sys.executable
+            desktop = r"[Environment]::GetFolderPath('Desktop')"
+            ps = (
+                "$d={d}; $l=Join-Path $d 'SSH-Connect.lnk'; "
+                "if(Test-Path $l){{exit}}; "
+                "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($l); "
+                "$s.TargetPath='{e}'; $s.WorkingDirectory='{w}'; "
+                "$s.IconLocation='{e},0'; $s.Description='SSH-Connect'; $s.Save()"
+            ).format(
+                d=desktop,
+                e=str(exe).replace("'", "''"),
+                w=str(PROJECT_ROOT).replace("'", "''"),
+            )
+            subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive",
+                 "-ExecutionPolicy", "Bypass", "-Command", ps],
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                timeout=30)
+        except Exception:
+            pass
+
+    def _interpreter_for_helpers(self):
+        """Интерпретатор для вспомогательных скриптов (move_cursor и т.п.).
+
+        В собранном exe sys.executable — это сам GUI, поэтому нужен внешний
+        python (SSH_env рядом с программой), иначе скрипт не запустить.
+        """
+        if not getattr(sys, "frozen", False):
+            return sys.executable
+        for cand in (
+            os.path.join(PROJECT_ROOT, "SSH_env", "Scripts", "pythonw.exe"),
+            os.path.join(PROJECT_ROOT, "SSH_env", "Scripts", "python.exe"),
+        ):
+            if os.path.exists(cand):
+                return cand
+        return None
 
     def _start_move_cursor(self):
         """Запустить move_cursor (клавиши → колесо мыши для tmux).
 
-        Единый файл <корень проекта>/move_cursor.py.
+        Единый файл <корень программы>/move_cursor.py. Настройки и журнал —
+        в папке пользователя (user_data), передаётся флагом --data-dir.
         При повторном запуске старый процесс убивается.
         """
         self._stop_move_cursor()
         move_cursor_path = os.path.join(PROJECT_ROOT, "move_cursor.py")
-        if os.path.exists(move_cursor_path):
-            self._log("Запуск Move Cursor...", "info")
-            self._move_cursor_proc = subprocess.Popen(
-                [sys.executable, move_cursor_path],
-                creationflags=subprocess.CREATE_NO_WINDOW)
-        else:
+        py = self._interpreter_for_helpers()
+        if not os.path.exists(move_cursor_path):
             self._log("⚠️ move_cursor не найден — PgUp/PgDn не будут "
                        "работать в tmux", "warning")
+            return
+        if not py:
+            self._log("⚠️ move_cursor: не найден python рядом с программой "
+                       "(SSH_env/Scripts/pythonw.exe)", "warning")
+            return
+        self._log("Запуск Move Cursor...", "info")
+        self._move_cursor_proc = subprocess.Popen(
+            [py, move_cursor_path, "--data-dir", paths.user_data_dir()],
+            creationflags=subprocess.CREATE_NO_WINDOW)
 
     def _stop_move_cursor(self):
         """Остановить процесс move_cursor, если он запущен."""
@@ -1165,6 +1611,8 @@ class SSHApp:
             w.configure(state=tk.NORMAL if connected else tk.DISABLED)
         self.tmux_session_combo.configure(
             state="readonly" if connected else "disabled")
+        self.kitty_window_combo.configure(
+            state="readonly" if connected else "disabled")
         try:
             self.access_status.configure(text="●",
                                          foreground="#6aab7e"
@@ -1178,15 +1626,65 @@ class SSHApp:
         self._stop_clipboard_sync()
         self._stop_reverse_access()
         self._stop_move_cursor()
-        if self._kitty:
-            try:
-                self._kitty.stop_watcher()
-            except Exception:
-                pass
+        self._stop_web_server()
+        self._close_kitty()
         try:
             self.root.destroy()
         except Exception:
             pass
+
+    def _close_kitty(self):
+        """Закрыть все окна KiTTY и дождаться выхода процессов.
+
+        Без этого kitty.exe остаётся висеть и держит свой exe-файл в папке
+        программы — удалить дистрибутив можно только после перезагрузки.
+        """
+        windows = list(self._kitty_windows.values())
+        if self._kitty is not None and self._kitty not in windows:
+            windows.append(self._kitty)
+        self._kitty_windows = {}
+        self._kitty = None
+        for kitty in windows:
+            try:
+                kitty.stop_watcher()
+            except Exception:
+                pass
+            try:
+                kitty.close_window()
+            except Exception:
+                pass
+        if windows:
+            time.sleep(0.3)
+        for kitty in windows:
+            try:
+                kitty.terminate()
+            except Exception:
+                pass
+
+    def _stop_web_server(self):
+        """Остановить запущенный нами uvicorn-бэкенд и закрыть его лог-файл.
+
+        Бэкенд выполняется из папки программы (SSH_env/pythonw.exe + main.py)
+        и держит файлы папки, если его не убить при выходе.
+        """
+        proc = self._web_server_proc
+        self._web_server_proc = None
+        if proc is not None:
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+            except Exception:
+                pass
+        if self._server_log_fd is not None:
+            try:
+                self._server_log_fd.close()
+            except Exception:
+                pass
+            self._server_log_fd = None
 
     # ================= обратный доступ =================
 
@@ -1421,31 +1919,71 @@ class SSHApp:
         """
         install_skill_if_missing(ssh, on_log=self._log)
 
-    def _send_to_kitty(self, text, restore=True):
-        """Отправить команду в окно KiTTY (должен быть запущен).
+    def _send_to_window(self, kit, text, restore=True):
+        """Отправить команду в конкретное окно KiTTY.
 
-        restore=True — развернуть окно KiTTY перед отправкой (используется
-        для команд, которые пользователь должен увидеть, напр. tmux new/attach).
-        restore=False — не трогать окно (напр. удаление сессии, где разворот
-        не нужен).
+        Если окно ещё проходит вход по SSH (только что открыто), команда
+        ставится в очередь и уходит сразу после готовности терминала —
+        иначе она была бы введена до появления shell и пропала бы.
+        restore=True — развернуть окно перед отправкой (пользователь должен
+        увидеть результат, напр. tmux new/attach).
         """
-        if not self._kitty:
-            self._log("❌ KiTTY не запущен", "error")
+        if not self._kitty_ready(kit):
+            self._log("⏳ {} ещё входит на сервер — команда уйдёт сразу "
+                      "после входа".format(getattr(kit, "name", "окно")),
+                      "info")
+            kit.queue_command(text, restore=restore)
             return
         if restore:
-            self._kitty.restore_window()
-        ok, msg = self._kitty.send_command(text)
+            try:
+                kit.restore_window()
+            except Exception:
+                pass
+        ok, msg = kit.send_command(text)
         if not ok:
             self._log("❌ KiTTY: {}".format(msg), "error")
 
+    def _kitty_ready(self, kit):
+        """Готово ли окно к вводу (у подделок в тестах — всегда да)."""
+        try:
+            return kit.is_ready()
+        except Exception:
+            return True
+
+    def _send_to_kitty(self, text, restore=True):
+        """Отправить команду в активное окно KiTTY (должно быть запущено).
+
+        Активное окно — то, что сейчас в фокусе Windows, иначе основное
+        окно 1 (либо последнее открытое дополнительное).
+        """
+        self._prune_kitty_windows()
+        kit = self._active_kitty()
+        if not kit:
+            self._log("❌ KiTTY не запущен", "error")
+            return
+        self._send_to_window(kit, text, restore=restore)
+
     def _tmux_sessions(self):
+        """Список сессий tmux на сервере.
+
+        Возвращает (ok, names): ok=False — проверить не удалось (нет
+        подключения / сбой сети) — в этом случае UI НЕ должен сбрасывать
+        список; ok=True — достоверный ответ сервера (пустой список =
+        сервер не запущен или сессий нет).
+        """
+        if not self._connected:
+            return False, []
         ok, out = self._execute_server_command("tmux ls 2>&1")
-        if not ok or not (out or "").strip():
-            return []
+        if not ok:
+            return False, []
+        out = (out or "").strip()
+        if not out:
+            return True, []
         low = out.lower()
-        if "no server running" in low or "no sessions" in low \
-                or "error" in low:
-            return []
+        if any(low.startswith(marker) for marker in (
+                "no server running", "no sessions", "error connecting",
+                "server error", "failed to connect")):
+            return True, []
         names = []
         seen = set()
         for line in out.splitlines():
@@ -1456,15 +1994,10 @@ class SSHApp:
             if name and name not in seen:
                 seen.add(name)
                 names.append(name)
-        return names
+        return True, names
 
-    def _refresh_tmux_combo(self):
-        """Обновить выпадающий список сессий tmux.
-
-        Если активных сессий нет — в списке отображается заглушка
-        «Нет сессий» (действием не является, отсекается в _tmux_attach/_kill).
-        """
-        sessions = self._tmux_sessions() if self._connected else []
+    def _apply_tmux_sessions(self, sessions):
+        """Применить список сессий к комбобоксу (вызывается только в UI-потоке)."""
         if sessions:
             self.tmux_session_combo["values"] = sessions
             current = self.tmux_session_combo.get()
@@ -1474,6 +2007,33 @@ class SSHApp:
             self.tmux_session_combo["values"] = [self.TMUX_NO_SESSIONS]
             self.tmux_session_combo.set(self.TMUX_NO_SESSIONS)
 
+    def _refresh_tmux_combo(self):
+        """Обновить выпадающий список сессий tmux (в фоне, без зависания UI).
+
+        `tmux ls` ходит на сервер по SSH синхронно; чтобы клик не блокировал
+        окно, запрос выполняется в отдельном потоке, а комбобокс обновляется
+        через root.after. Если проверить не удалось (сбой сети) — текущий
+        список сохраняется, НЕ сбрасывается на «Нет сессий».
+        """
+        if getattr(self, "_tmux_refreshing", False):
+            return
+        self._tmux_refreshing = True
+
+        def worker():
+            try:
+                ok, sessions = self._tmux_sessions()
+                if not ok:
+                    return
+                root = self.root
+                try:
+                    root.after(0, lambda: self._apply_tmux_sessions(sessions))
+                except Exception:
+                    pass
+            finally:
+                self._tmux_refreshing = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _on_tmux_combo_click(self, event=None):
         """Клик по выпадающему списку — перечитать сессии с сервера."""
         if self.tmux_session_combo.cget("state") == "disabled":
@@ -1481,7 +2041,12 @@ class SSHApp:
         self._refresh_tmux_combo()
 
     def _tmux_new(self):
-        """Создать новую сессию tmux."""
+        """Создать новую сессию tmux в СВОБОДНОМ дополнительном окне KiTTY.
+
+        Так каждое окно терминала получает свою сессию, а основное окно 1
+        остаётся нетронутым. Если все 4 дополнительных окна заняты — сессия
+        создаётся в активном окне с предупреждением.
+        """
         if not self._connected:
             return
         name = self._dlg_askstring("Новая сессия tmux", "Имя сессии:")
@@ -1490,29 +2055,67 @@ class SSHApp:
         if not name.strip():
             self._log("Имя сессии не может быть пустым", "error")
             return
+        slot = self._free_kitty_slot()
+        kit = self._use_kitty_slot(slot) if slot is not None else None
+        if slot is not None and kit is None:
+            return  # не удалось открыть окно — сообщение уже в журнале
+        if kit is None:
+            kit = self._active_kitty()
+            if kit is None:
+                self._log("❌ KiTTY не запущен", "error")
+                return
+            self._log("⚠️ Все дополнительные окна заняты — сессия "
+                      "откроется в {}", "warning".format(kit.name))
+        else:
+            self._log("🪟 Сессия откроется в {}".format(kit.name), "info")
         self._log("Создаю сессию tmux '{}'...".format(name), "info")
-        self._send_to_kitty("tmux new -s {}".format(name))
+        self._send_to_window(kit, "tmux new -s {}".format(shlex.quote(name)))
+        kit.in_tmux = True  # после `tmux new` окно окажется внутри сессии
         self.root.after(3000, self._refresh_tmux_combo)
 
-    def _tmux_attach(self):
-        """Подключиться к сессии tmux из выпадающего списка.
+    def _tmux_selected_name(self):
+        """Имя выбранной в комбобоксе сессии (или None при заглушке).
 
-        Внутри tmux работает `tmux switch-client`; вне tmux — обычный
-        `tmux attach`. Если сессия/сервер уже исчезли — русская заглушка.
+        Если в списке заглушка «Нет сессий» — синхронно перечитаем разок:
+        это единственный случай, когда список мог устареть (сессия появилась
+        после последнего обновления), а задержка тут приемлема.
         """
-        name = self.tmux_session_combo.get().strip()
-        if not name or name == self.TMUX_NO_SESSIONS:
-            self._refresh_tmux_combo()
-            name = self.tmux_session_combo.get().strip()
-        if not name or name == self.TMUX_NO_SESSIONS:
+        name = (self.tmux_session_combo.get() or "").strip()
+        if name and name != self.TMUX_NO_SESSIONS:
+            return name
+        ok, sessions = self._tmux_sessions()
+        if ok and sessions:
+            self._apply_tmux_sessions(sessions)
+            name = (self.tmux_session_combo.get() or "").strip()
+            if name and name != self.TMUX_NO_SESSIONS:
+                return name
+        return None
+
+    def _tmux_attach(self):
+        """Подключить окно терминала к сессии tmux из выпадающего списка.
+
+        Команда зависит от того, что мы знаем про окно: только что открытое
+        окно монтируется через `tmux attach`, окно, уже находящееся внутри
+        сессии, — через `tmux switch-client` (внутри tmux attach запрещён).
+        Если сессия исчезла — печатается русская заглушка.
+        """
+        name = self._tmux_selected_name()
+        if not name:
             self._log("❌ Нет активных сессий tmux. Создайте новую "
                       "кнопкой «Новая»", "error")
             return
-        self._log("Подключаюсь к сессии tmux '{}'...".format(name), "info")
-        self._send_to_kitty(
-            "tmux switch-client -t {} 2>/dev/null || "
-            "tmux attach -t {} 2>/dev/null || echo 'Нет сессии tmux'".format(
-                name, name))
+        kit = self._active_kitty()
+        if kit is None:
+            self._log("❌ KiTTY не запущен", "error")
+            return
+        inside = getattr(kit, "in_tmux", None)
+        action = "подключаю" if inside is False else "переключаю на"
+        self._log("{} сессию tmux '{}' в {}".format(
+            action, name, getattr(kit, "name", "окно")), "info")
+        self._send_to_window(
+            kit, build_tmux_attach_command(name, inside_tmux=inside))
+        # после монтирования окно окажется внутри сессии
+        kit.in_tmux = True
 
     def _tmux_kill(self):
         """Удалить сессию tmux (необратимо).
@@ -1520,11 +2123,8 @@ class SSHApp:
         Сначала выходим из текущей сессии в KiTTY (`tmux detach`), чтобы
         клиент не «умер» вместе с убитой сессией, затем отправляем kill.
         """
-        name = self.tmux_session_combo.get().strip()
-        if not name or name == self.TMUX_NO_SESSIONS:
-            self._refresh_tmux_combo()
-            name = self.tmux_session_combo.get().strip()
-        if not name or name == self.TMUX_NO_SESSIONS:
+        name = self._tmux_selected_name()
+        if not name:
             self._log("❌ Нет активных сессий tmux для удаления", "error")
             return
         if not self._dlg_confirm(
@@ -1534,12 +2134,15 @@ class SSHApp:
                 danger=True):
             return
         self._log("Удаляю сессию tmux '{}'...".format(name), "info")
-        if self._kitty:
+        kit = self._active_kitty()
+        if kit is not None:
             self._log("Выхожу из текущей сессии tmux (tmux detach)...",
                       "info")
-            self._send_to_kitty("tmux detach", restore=False)
+            self._send_to_window(kit, "tmux detach", restore=False)
+            kit.in_tmux = False  # после detach мы снова вне сессии
             time.sleep(0.3)
-        self._send_to_kitty("tmux kill-session -t {}".format(name), restore=False)
+        self._send_to_kitty("tmux kill-session -t {}".format(
+            shlex.quote(name)), restore=False)
         self.root.after(1000, self._refresh_tmux_combo)
 
     # ================= веб-интерфейс =================
@@ -1590,7 +2193,7 @@ class SSHApp:
         except OSError:
             self._server_log_fd = None
         try:
-            subprocess.Popen(
+            self._web_server_proc = subprocess.Popen(
                 [py, "main.py"],
                 cwd=BACKEND_DIR,
                 creationflags=subprocess.CREATE_NO_WINDOW,
@@ -1662,6 +2265,47 @@ class SSHApp:
         if not hostname:
             self._log("❌ Ошибка: укажите хост сервера", "error")
             return
+        # Локальный маркер: блок установки уже показывали этому хосту.
+        if docker_setup_done(hostname):
+            self._show_docker_browser(hostname)
+            return
+        # Маркера нет (в т.ч. после переустановки программы) — спрашиваем
+        # сам сервер, установлен ли docker + контейнер chrome, чтобы НЕ
+        # запускать установку заново в каждой новой версии программы.
+        self._log("🔎 Проверяю установку Docker-браузера на сервере…", "info")
+        root = self.root
+
+        def worker():
+            try:
+                ok, out = self._execute_server_command(DOCKER_CHECK_COMMAND)
+                installed = bool(ok) and parse_docker_installed(out)
+            except Exception:
+                installed = False
+            try:
+                root.after(0, lambda: self._apply_docker_check(
+                    hostname, installed))
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_docker_check(self, hostname, installed):
+        """Итог серверной проверки (вызывается в UI-потоке)."""
+        if installed:
+            mark_docker_setup_done(hostname)
+            self._log("✅ Docker-браузер уже установлен на сервере", "success")
+            self._show_docker_browser(hostname)
+            return
+        # Не установлено — печатаем в KiTTY блок установки docker + chrome
+        # вместо открытия браузера.
+        if self._type_docker_setup():
+            mark_docker_setup_done(hostname)
+            self._log("🔧 Команды установки docker/контейнера введены в "
+                      "терминал. Когда контейнер 'chrome' поднимется — "
+                      "нажмите «Docker-браузер» ещё раз.", "info")
+
+    def _show_docker_browser(self, hostname):
+        """Открыть браузер и включить синхронизацию буфера обмена."""
         url = "https://{}:3001".format(hostname)
         self._log("🐳 Открываю Docker-браузер: {}".format(url), "info")
         webbrowser.open(url)
@@ -1669,6 +2313,29 @@ class SSHApp:
             self._clip_thread = ClipboardSyncThread(
                 self.ssh, log_callback=self._thread_log)
             self._clip_thread.start()
+
+    def _type_docker_setup(self):
+        """Печатать в KiTTY блок установки docker + контейнера chrome.
+
+        Строки отправляются по одной с Enter в конце — так каждая команда
+        выполняется отдельно (как если бы пользователь вводил её вручную).
+        Возвращает True, если все строки отправлены.
+        """
+        if not self._kitty:
+            self._log("❌ KiTTY не запущен", "error")
+            return False
+        self._kitty.restore_window()
+        for line in DOCKER_SETUP_BLOCK.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            ok, msg = self._kitty.send_command(line)
+            if not ok:
+                self._log("❌ KiTTY: не удалось отправить команду: {}".format(
+                    msg), "error")
+                return False
+            time.sleep(0.1)
+        return True
 
     def _stop_clipboard_sync(self):
         """Остановить синхронизацию буфера обмена."""

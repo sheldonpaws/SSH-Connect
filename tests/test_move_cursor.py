@@ -82,6 +82,17 @@ class TestConfig(unittest.TestCase):
         with open(self.log_path, "r", encoding="utf-8") as f:
             self.assertIn("shown", f.read())
 
+    def test_set_data_dir_moves_config_and_log(self):
+        data_dir = os.path.join(self.tmp.name, "user_data")
+        mc._set_data_dir(data_dir)
+        self.assertTrue(os.path.isdir(data_dir))
+        self.assertEqual(
+            os.path.normpath(mc.CONFIG_FILE),
+            os.path.join(data_dir, "move_cursor.json"))
+        self.assertEqual(
+            os.path.normpath(mc.LOG_FILE),
+            os.path.join(data_dir, "move_cursor.log"))
+
 
 if __name__ == "__main__":
     unittest.main()

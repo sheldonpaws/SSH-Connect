@@ -37,6 +37,17 @@ class TestKittyLauncher(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("недоступно", msg)
 
+    def test_send_command_passes_hostname(self):
+        calls = []
+        original = kl.find_kitty_window
+        kl.find_kitty_window = lambda hostname: calls.append(hostname) or None
+        try:
+            ok, msg = kl.send_command("echo hi", hostname="example.com")
+        finally:
+            kl.find_kitty_window = original
+        self.assertEqual(calls, ["example.com"])
+        self.assertFalse(ok)
+
 
 if __name__ == "__main__":
     unittest.main()

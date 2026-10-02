@@ -218,6 +218,7 @@ __marimo__/
 .streamlit/secrets.toml
 
 # SSH-Connect runtime data (secrets and per-machine state)
+user_data/
 ssh_connections.json
 last_profile.txt
 .encryption_key

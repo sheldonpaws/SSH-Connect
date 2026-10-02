@@ -449,7 +449,9 @@ async def launch(req: LaunchRequest):
     if not command:
         return {'success': False, 'error': 'Пустая команда'}
     import kitty_launcher
-    success, message = kitty_launcher.send_command(command)
+    success, message = kitty_launcher.send_command(
+        command,
+        hostname=getattr(sessions[req.session_id], 'hostname', None))
     return {'success': success, 'message': message}
 
 

@@ -18,10 +18,11 @@ if sys.executable.endswith('python.exe'):
 
 import tkinter as tk
 from src.gui import SSHApp
+from src.paths import project_root
 
 root = tk.Tk()
 
-icon_path = os.path.join(os.path.dirname(__file__), "favicon.ico")
+icon_path = os.path.join(project_root(), "favicon.ico")
 if os.path.exists(icon_path):
     root.iconbitmap(icon_path)
 

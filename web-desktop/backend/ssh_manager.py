@@ -12,10 +12,16 @@ from typing import Optional
 
 
 def _get_known_hosts_path() -> str:
-    """Путь к файлу known_hosts проекта"""
+    """Путь к known_hosts в папке пользователя (user_data/SshHostKeys).
+
+    Зеркало src/hostkeys.py (бэкенд работает отдельным процессом):
+    project_root -> user_data (переопределяется SSH_CONNECT_USER_DATA).
+    """
     backend_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.join(backend_dir, "..", "..")
-    folder = os.path.join(project_root, "SshHostKeys")
+    user_data = os.path.join(project_root, "user_data")
+    user_data = os.environ.get("SSH_CONNECT_USER_DATA") or user_data
+    folder = os.path.join(user_data, "SshHostKeys")
     os.makedirs(folder, exist_ok=True)
     return os.path.join(folder, "known_hosts")
 
@@ -54,11 +60,13 @@ class SSHSession:
         self.shell_thread: Optional[threading.Thread] = None
         self.running = False
         self.callbacks = []
+        self.hostname: Optional[str] = None
 
     def connect(self, hostname: str, port: int, username: str,
                 password: Optional[str] = None, key_file: Optional[str] = None) -> tuple[bool, str]:
         """Подключение к серверу"""
         try:
+            self.hostname = hostname
             self.client = paramiko.SSHClient()
             _prepare_host_keys(self.client)
 
