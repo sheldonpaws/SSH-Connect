@@ -7,17 +7,19 @@ SSH Connect — графический интерфейс (Tkinter).
 в окно KiTTY тем же способом, зеркально web-desktop/backend/kitty_launcher.py.
 
 SSHApp — главное окно: форма подключения, профили (ssh_connections.json),
-tmux-ряд (row 5), кнопки веб-интерфейса / docker-браузера / обратного доступа.
+tmux-ряд (row 5), кнопки веб-интерфейса / обратного доступа.
 Внешний вид — палитра FangUnion (фиолетовый, серебристый, бархатно-чёрный,
 золотые акценты), перенесён из оригинала (бэкап D:\\SSH-Connect).
 """
 
 import json
 import os
+import queue
 import re
 import shlex
 import socket
 import sys
+import collections
 import subprocess
 import tempfile
 import threading
@@ -32,7 +34,6 @@ from tkinter import ttk, filedialog
 from datetime import datetime
 
 from src import paths
-from src.clipboard_sync import ClipboardSyncThread
 from src.hermes_skills import install_skill_if_missing
 from src.reverse_access import ReverseAccess, make_slug
 from src.ssh import SSHClient
@@ -40,6 +41,11 @@ from src.utils import load_connections, save_connections
 from src.hostkeys import get_hostkey_blob
 
 PROJECT_ROOT = paths.project_root()
+
+# Ссылки вшиты в программу; Документация.txt рядом с exe может их переопределить
+# (первые/подходящие http:// из файла — тоже заполнит PR-влечение к проекту).
+DOC_URL = "https://github.com/sheldonpaws/Help/tree/main/SSH%20Connect"
+DONATE_URL = "https://yoomoney.ru/to/4100116344469196"
 CONNECTIONS_FILE = paths.user_data_path("ssh_connections.json")
 LAST_PROFILE_FILE = paths.user_data_path("last_profile.txt")
 USER_DATA_DIR = paths.user_data_dir()
@@ -96,6 +102,13 @@ class KittyController:
         # проходит вход по SSH (ввод пароля, баннер) — команда, отправленная
         # в этот момент, просто теряется, поэтому её ставят в очередь.
         self._ready = threading.Event()
+        # FIFO-очередь отложенных команд. Раньше на каждый queue_command
+        # создавался свой поток, и при готовности окна все они просыпались
+        # одновременно — символы нескольких команд перемешивались. Теперь
+        # команды выполняются строго по одной, в порядке добавления.
+        self._q_lock = threading.Lock()
+        self._q_items = collections.deque()
+        self._q_running = False
         self._started_at = time.time()
         self._password_at = None
         self._last_log_change = time.time()
@@ -184,16 +197,13 @@ class KittyController:
             except Exception:
                 pass
 
-    # сколько пикселей терминал должен возвышаться над верхним краем главного окна
-    RESTORE_RAISE = 60
-
     def restore_window(self):
-        """Развернуть окно KiTTY чуть выше главного окна.
+        """Развернуть окно KiTTY прямо под главным окном.
 
-        Терминал разворачивается, центрируется по горизонтали относительно
-        главного окна и приподнимается так, чтобы его верхний край был на
-        RESTORE_RAISE px выше верха главного окна. z-order не трогаем —
-        окно остаётся там, где оно есть (обычно поверх главного).
+        Терминал разворачивается и ставится так, чтобы его лево-верхний угол
+        совпал с лево-нижним углом главного окна: левые края на одной линии,
+        верх терминала — сразу под нижним краем главного окна. z-order не
+        трогаем — окно остаётся там, где оно есть (обычно поверх главного).
         """
         hwnd = self._find_hwnd()
         if not hwnd:
@@ -210,9 +220,8 @@ class KittyController:
             if main_hwnd:
                 main_rect = wintypes.RECT()
                 self._user32.GetWindowRect(main_hwnd, ctypes.byref(main_rect))
-                target_y = max(0, main_rect.top - self.RESTORE_RAISE)
-                target_x = main_rect.left + (
-                    (main_rect.right - main_rect.left) - tw) // 2
+                target_x = max(0, main_rect.left)
+                target_y = max(0, main_rect.bottom)
             else:
                 target_x = term_rect.left
                 target_y = term_rect.top
@@ -415,6 +424,9 @@ class KittyController:
     # Приглашение оболочки в конце строки: «user@host:~$ », «root@host:~# ».
     _SHELL_PROMPT_RE = re.compile(r"[\$#%>][ \t]*\r?\n?$")
     READY_TIMEOUT = 25.0
+    # Пауза между двумя отложенными командами в очереди — чтобы терминал
+    # успевал отрисовать вывод предыдущей и не проглатывал ввод следующей.
+    QUEUE_GAP = 0.3
 
     def is_ready(self):
         """Готово ли окно KiTTY принимать команды (вход завершён)."""
@@ -450,22 +462,41 @@ class KittyController:
         Нужно для свежеоткрытого окна: сразу после запуска идёт вход по SSH,
         ввод пароля и загрузка баннера — команда, отправленная в этот момент,
         теряется. Выполняется в отдельном потоке, UI не блокируется.
+
+        Вызовы ВЫПОЛНЯЮТСЯ СТРОГО ПО ОДНОМУ в порядке добавления: поток-
+       планировщик один на всё окно, поэтому блок из нескольких команд
+        не перемешивается символами.
         """
         limit = self.READY_TIMEOUT if timeout is None else timeout
+        with self._q_lock:
+            self._q_items.append((text, restore, limit))
+            start_worker = not self._q_running
+            self._q_running = True
+        if start_worker:
+            threading.Thread(target=self._drain_queue, daemon=True).start()
 
-        def worker():
-            if not self._ready.wait(limit):
-                # окно не отмечено готовым (нет приглашения shell) — небольшая
-                # пауза, чтобы допечатался баннер, и отправляем в любом случае
-                time.sleep(1.0)
+    def _drain_queue(self):
+        """Разбирать отложенные команды по одной, пока очередь не кончится."""
+        while True:
+            with self._q_lock:
+                if not self._q_items:
+                    self._q_running = False
+                    return
+                text, restore, limit = self._q_items.popleft()
             try:
+                if not self._ready.wait(limit):
+                    # окно не отмечено готовым (нет приглашения shell) —
+                    # небольшая пауза, чтобы допечатался баннер, и отправляем
+                    # в любом случае
+                    time.sleep(1.0)
                 if restore:
                     self.restore_window()
                 self.send_command(text)
             except Exception:
                 pass
-
-        threading.Thread(target=worker, daemon=True).start()
+            # пауза между командами: терминал должен успеть отрисовать вывод
+            # предыдущей, иначе ввод следующей проглатывается
+            time.sleep(self.QUEUE_GAP)
 
     def _send_password(self):
         """Ввести пароль в KiTTY через PostMessage (не зависит от фокуса)."""
@@ -539,70 +570,6 @@ class Tooltip:
             self._tip_window = None
 
 
-# Блок установки docker + контейнера chrome (linuxserver/chrome, порт 3001):
-# печатается в KiTTY при ПЕРВОМ нажатии кнопки «Docker-браузер» на этом хосте,
-# дальше кнопка просто открывает браузер. Маркер «показывали» хранится в
-# user_data/docker_setup_done.json — блок не повторяется ни в этой сессии, ни
-# после перезапуска. Строки уходят в терминал по одной с Enter в конце, поэтому
-# многострочная конкатенация `\` здесь свёрнута в одну команду.
-DOCKER_SETUP_BLOCK = """\
-sudo apt update
-sudo apt install -y ca-certificates curl gnupg
-sudo install -m 0755 -d /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-sudo apt update && sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-docker run -d --name=chrome -e PUID=1000 -e PGID=1000 -e TZ=Europe/Moscow -e LC_ALL=ru_RU.UTF-8 -p 3001:3001 -v /opt/chrome/config:/config --shm-size=1gb --restart unless-stopped lscr.io/linuxserver/chrome:latest
-"""
-
-
-# Проверка «уже установлено?» на САМОМ сервере. Локальный маркер
-# user_data/docker_setup_done.json теряется при переустановке программы
-# (новая версия = новая папка user_data), поэтому перед показом блока
-# установки спрашиваем у VPS: есть ли docker и контейнер 'chrome'. Так
-# блок не повторяется в каждой новой версии программы.
-DOCKER_BROWSER_READY = "DOCKER_BROWSER_READY"
-DOCKER_CHECK_COMMAND = (
-    "if command -v docker >/dev/null 2>&1 && "
-    "docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx chrome; "
-    "then echo " + DOCKER_BROWSER_READY + "; "
-    "else echo DOCKER_BROWSER_MISSING; fi"
-)
-
-
-def parse_docker_installed(output) -> bool:
-    """Установлен ли docker-браузер по ответу DOCKER_CHECK_COMMAND."""
-    return DOCKER_BROWSER_READY in (output or "")
-
-
-def _docker_setup_marker_path():
-    return paths.user_data_path("docker_setup_done.json")
-
-
-def docker_setup_done(hostname) -> bool:
-    """Показывался ли блок установки docker этому хосту (по файлу-маркеру)."""
-    try:
-        with open(_docker_setup_marker_path(), "r", encoding="utf-8") as f:
-            return hostname in json.load(f)
-    except Exception:
-        return False
-
-
-def mark_docker_setup_done(hostname):
-    """Запомнить, что блоку установки этот хост уже показывался."""
-    path = _docker_setup_marker_path()
-    try:
-        data = {}
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        data[hostname] = True
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-    except Exception:
-        pass
-
-
 def build_tmux_attach_command(name, inside_tmux=None):
     """Команда монтирования сессии tmux в окно терминала.
 
@@ -631,6 +598,10 @@ class SSHApp:
 
     TMUX_NO_SESSIONS = "Нет сессий"
 
+    # Период опроса очереди вызовов в UI-поток (см. _poll_ui_queue): Tk нельзя
+    # трогать из фоновых потоков.
+    UI_POLL_MS = 100
+
     # Окна KiTTY: 1 — основное (открывается при подключении, работает как
     # раньше), 2..5 — четыре ДОПОЛНИТЕЛЬНЫХ окна. Список слотов фиксирован:
     # он никогда не растёт, поэтому при каждом подключении в селекторе
@@ -655,15 +626,14 @@ class SSHApp:
     def __init__(self, root):
         self.root = root
         self.root.title("SSH Client by Dog Wisdom Project")
-        self.root.geometry("980x460")
-        self.root.minsize(980, 460)
+        self.root.geometry("740x460")
+        self.root.minsize(740, 460)
 
         self.ssh = None
         self._kitty = None
         self._kitty_windows = {}  # слот окна KiTTY (1..5) -> KittyController
         self._connected = False
         self._last_creds = None
-        self._clip_thread = None
         self._reverse = None
         self._reverse_active = False
         self._reverse_folders = []  # список выбранных папок для доступа
@@ -676,6 +646,15 @@ class SSHApp:
         # не блокирует UI). Результат — в self._hermes_skill_state:
         # 'already_present' | 'installed' | 'hermes_missing'
         self._hermes_skill_state = 'hermes_missing'
+        # Очередь вызовов в UI-поток. Tk не потокобезопасен, а root.after из
+        # фонового потока кидает RuntimeError('main thread is not in main
+        # loop'), когда главный поток в этот момент не в главном цикле
+        # (диалог, закрытие окна, update()) — раньше это исключение молча
+        # глушилось и результат фоновой проверки просто терялся: в журнале
+        # навсегда оставалось «Проверяю…». Теперь поток кладёт работу в
+        # очередь, а таймер, запущенный из главного потока, её выполняет.
+        self._ui_queue = queue.Queue()
+        self.root.after(self.UI_POLL_MS, self._poll_ui_queue)
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
 
         # Папка пользователя (создаётся при первом запуске).
@@ -842,8 +821,15 @@ class SSHApp:
                         cursor="hand2", background=self.PAL_BLACK_VELVET,
                         font=("Georgia", 10, "underline"))
         link.pack(side=tk.RIGHT)
-        link.bind("<Button-1>", lambda e: webbrowser.open(
-            "https://github.com/sheldonpaws/Help/tree/main/VPS%20%D0%B8%20Hermes"))
+        link.bind("<Button-1>", lambda e: self._open_documentation())
+
+        donate = tk.Label(header, text="Дам денюжку на развитие проектов "
+                                       "Dog Wisdom industries",
+                          foreground=self.PAL_GOLD, cursor="hand2",
+                          background=self.PAL_BLACK_VELVET,
+                          font=("Georgia", 10, "underline"))
+        donate.pack(side=tk.RIGHT, padx=(0, 12))
+        donate.bind("<Button-1>", lambda e: self._open_donation())
 
         self._create_connection_panel()
         self._create_status_area()
@@ -924,11 +910,6 @@ class SSHApp:
                                         command=self._open_web_interface,
                                         width=15, state=tk.DISABLED)
         self.webserver_btn.pack(side=tk.LEFT, padx=5)
-
-        self.docker_browser_btn = ttk.Button(btn_frame, text="Docker-браузер",
-                                             command=self._open_docker_browser,
-                                             width=16, state=tk.DISABLED)
-        self.docker_browser_btn.pack(side=tk.LEFT, padx=5)
 
         self.access_btn = ttk.Button(btn_frame, text="Доступ",
                                      command=self._toggle_reverse, width=8,
@@ -1148,15 +1129,49 @@ class SSHApp:
         self.output_text.insert(tk.END, message + "\n", tag)
         self.output_text.see(tk.END)
 
-    def _queue_log(self, msg, level="info"):
+    # --- вызовы в UI-поток из фоновых потоков --------------------------------
+    # Tk нельзя трогать из чужого потока: root.after(0, …) может кинуть
+    # RuntimeError('main thread is not in main loop'), когда главный поток в
+    # этот момент не крутит Tcl-цикл. Раньше такие исключения подавлялись
+    # (except Exception: pass) и результат работы фонового потока молча
+    # терялся. Обходной путь: поток кладёт колбэк в self._ui_queue, а таймер,
+    # запущенный в __init__ ИЗ главного потока, вытаскивает их оттуда.
+
+    def _dispatch_ui(self, fn):
+        """Выполнить fn в UI-потоке: основной путь — root.after, запасной —
+        очередь с опросом таймером."""
         try:
-            self.root.after(0, lambda: self._log(msg, level))
+            self.root.after(0, fn)
+            return True
+        except Exception:
+            try:
+                self._ui_queue.put(fn)
+                return True
+            except Exception:
+                return False
+
+    def _poll_ui_queue(self):
+        """Выполнить накопленные фоновые вызовы (главный поток)."""
+        while True:
+            try:
+                fn = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn()
+            except Exception as exc:
+                try:
+                    self._log("⚠️ Ошибка фонового вызова: {}".format(exc),
+                              "warning")
+                except Exception:
+                    pass
+        try:
+            self.root.after(self.UI_POLL_MS, self._poll_ui_queue)
         except Exception:
             pass
 
-    def _thread_log(self, msg, level="info"):
-        """Лог из фоновых потоков — перебрасываем в главный через root.after."""
-        self._queue_log(msg, level)
+    def _queue_log(self, msg, level="info"):
+        self._dispatch_ui(lambda: self._log(msg, level))
 
     # ================= Профили =================
 
@@ -1323,10 +1338,12 @@ class SSHApp:
 
     def _do_ensure_hermes_skill(self, ssh):
         """Поставить скил Hermes в фоне + показать результат в UI."""
-        from src.hermes_skills import install_skill_if_missing
-        state = install_skill_if_missing(ssh, on_log=self._log)
+        # on_log итоговый вызов идёт из ФОНОВОГО потока — только
+        # _queue_log/_dispatch_ui, иначе Tk кидает RuntimeError и строки
+        # установки теряются.
+        state = install_skill_if_missing(ssh, on_log=self._queue_log)
         self._hermes_skill_state = state
-        self.root.after(0, self._on_hermes_skill_done, state)
+        self._dispatch_ui(lambda: self._on_hermes_skill_done(state))
 
     def _on_hermes_skill_done(self, state):
         """Обновить tooltip индикатора доступа после установки скила."""
@@ -1583,7 +1600,6 @@ class SSHApp:
         """Отключение"""
         if not self._connected:
             return
-        self._stop_clipboard_sync()
         self._stop_reverse_access()
         self._stop_move_cursor()
 
@@ -1604,8 +1620,7 @@ class SSHApp:
         """Кнопки управления активны только пока есть подключение."""
         self.connect_btn.configure(
             state=tk.NORMAL if not connected else tk.DISABLED)
-        for w in (self.disconnect_btn, self.webserver_btn,
-                  self.docker_browser_btn, self.access_btn,
+        for w in (self.disconnect_btn, self.webserver_btn, self.access_btn,
                   self.tmux_attach_btn,
                   self.tmux_new_btn, self.tmux_kill_btn):
             w.configure(state=tk.NORMAL if connected else tk.DISABLED)
@@ -1623,7 +1638,6 @@ class SSHApp:
 
     def _on_closing(self):
         """Очистка и закрытие"""
-        self._stop_clipboard_sync()
         self._stop_reverse_access()
         self._stop_move_cursor()
         self._stop_web_server()
@@ -1854,33 +1868,6 @@ class SSHApp:
             self._log("⚪ Обратный доступ выключен", "info")
         self._write_reverse_json({})
 
-    def _read_reverse_json(self):
-        """Прочитать ~/.hermes/reverse_access.json с VPS.
-
-        Возвращает ЧИСТЫЙ словарь {папка: url} — записи старого формата
-        (records-массив, "active" флаги и т.п.) отбрасываются, чтобы не
-        замусоривать файл при записи.
-        """
-        if not (self._connected and self.ssh):
-            return {}
-        ok, out = self._execute_server_command(
-            "python3 -c \"import json,os;"
-            "f=os.path.expanduser('~/.hermes/reverse_access.json');"
-            "print(json.dumps(json.load(open(f))) if os.path.exists(f) else '{}')\"")
-        if not ok:
-            return {}
-        try:
-            data = json.loads(out.strip())
-        except Exception:
-            return {}
-        if not isinstance(data, dict):
-            return {}
-        clean = {}
-        for folder, url in data.items():
-            if isinstance(folder, str) and isinstance(url, str) and url.startswith("http"):
-                clean[folder] = url
-        return clean
-
     def _write_reverse_json(self, data):
         """Записать reverse_access.json на VPS (base64, без проблем с кавычками)."""
         if not (self._connected and self.ssh):
@@ -1906,18 +1893,10 @@ class SSHApp:
 
     # ================= tmux =================
 
-    def _execute_server_command(self, command):
+    def _execute_server_command(self, command, timeout=None):
         if not self.ssh or not self.ssh.is_connected:
             return False, "Нет подключения"
-        return self.ssh.execute_command(command)
-
-    def _ensure_hermes_skill(self, ssh):
-        """Поставить скил Hermes 'reverse-ssh-tunnel' на VPS в фоновом потоке.
-
-        Вызывается после успешного подключения; ничего не блокирует и молчит
-        об ошибках (если hermes нет на сервере — просто пропускает).
-        """
-        install_skill_if_missing(ssh, on_log=self._log)
+        return self.ssh.execute_command(command, timeout=timeout)
 
     def _send_to_window(self, kit, text, restore=True):
         """Отправить команду в конкретное окно KiTTY.
@@ -2024,11 +2003,9 @@ class SSHApp:
                 ok, sessions = self._tmux_sessions()
                 if not ok:
                     return
-                root = self.root
-                try:
-                    root.after(0, lambda: self._apply_tmux_sessions(sessions))
-                except Exception:
-                    pass
+                # _dispatch_ui, а не root.after: вызов из потока может
+                # кинуть RuntimeError и список сессий обновился бы не всегда
+                self._dispatch_ui(lambda: self._apply_tmux_sessions(sessions))
             finally:
                 self._tmux_refreshing = False
 
@@ -2212,6 +2189,41 @@ class SSHApp:
         self._log("⚠️ Веб-сервер не поднялся за 15 c", "error")
         return False
 
+    def _read_doc_urls(self):
+        """Все http(s)-ссылки из Документация.txt (файл у корня приложения).
+
+        Текстовые строки-комментарии (без http://) игнорируются.
+        """
+        urls = []
+        try:
+            with open(os.path.join(PROJECT_ROOT, "Документация.txt"),
+                      "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.lower().startswith(("http://", "https://")):
+                        urls.append(line)
+        except OSError:
+            pass
+        return urls
+
+    def _open_documentation(self):
+        """Документация: GitHub-ссылка из Документация.txt (если есть),
+        иначе вшитая в программу DOC_URL."""
+        for url in self._read_doc_urls():
+            if "github" in url.lower():
+                webbrowser.open(url)
+                return
+        webbrowser.open(DOC_URL)
+
+    def _open_donation(self):
+        """Донат: первая ссылка из Документация.txt (если есть), иначе
+        вшитая в программу DONATE_URL."""
+        urls = self._read_doc_urls()
+        if urls:
+            webbrowser.open(urls[0])
+        else:
+            webbrowser.open(DONATE_URL)
+
     def _open_web_interface(self):
         """Запустить локальный веб-интерфейс и открыть в браузере."""
         if not self._connected:
@@ -2252,99 +2264,6 @@ class SSHApp:
         url = "http://127.0.0.1:8000/?s={}&t={}".format(sid, auth)
         self._log("🌐 Открываю веб-интерфейс...", "info")
         webbrowser.open(url)
-
-    # ================= docker-браузер =================
-
-    def _open_docker_browser(self):
-        """Открыть Docker-браузер на сервере (https://<хост>:3001) и включить
-        синхронизацию буфера обмена с ним."""
-        if not self._connected:
-            self._log("❌ Ошибка: сначала подключитесь к серверу!", "error")
-            return
-        hostname = self._last_creds.get("hostname", "")
-        if not hostname:
-            self._log("❌ Ошибка: укажите хост сервера", "error")
-            return
-        # Локальный маркер: блок установки уже показывали этому хосту.
-        if docker_setup_done(hostname):
-            self._show_docker_browser(hostname)
-            return
-        # Маркера нет (в т.ч. после переустановки программы) — спрашиваем
-        # сам сервер, установлен ли docker + контейнер chrome, чтобы НЕ
-        # запускать установку заново в каждой новой версии программы.
-        self._log("🔎 Проверяю установку Docker-браузера на сервере…", "info")
-        root = self.root
-
-        def worker():
-            try:
-                ok, out = self._execute_server_command(DOCKER_CHECK_COMMAND)
-                installed = bool(ok) and parse_docker_installed(out)
-            except Exception:
-                installed = False
-            try:
-                root.after(0, lambda: self._apply_docker_check(
-                    hostname, installed))
-            except Exception:
-                pass
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _apply_docker_check(self, hostname, installed):
-        """Итог серверной проверки (вызывается в UI-потоке)."""
-        if installed:
-            mark_docker_setup_done(hostname)
-            self._log("✅ Docker-браузер уже установлен на сервере", "success")
-            self._show_docker_browser(hostname)
-            return
-        # Не установлено — печатаем в KiTTY блок установки docker + chrome
-        # вместо открытия браузера.
-        if self._type_docker_setup():
-            mark_docker_setup_done(hostname)
-            self._log("🔧 Команды установки docker/контейнера введены в "
-                      "терминал. Когда контейнер 'chrome' поднимется — "
-                      "нажмите «Docker-браузер» ещё раз.", "info")
-
-    def _show_docker_browser(self, hostname):
-        """Открыть браузер и включить синхронизацию буфера обмена."""
-        url = "https://{}:3001".format(hostname)
-        self._log("🐳 Открываю Docker-браузер: {}".format(url), "info")
-        webbrowser.open(url)
-        if not self._clip_thread or not self._clip_thread.is_alive():
-            self._clip_thread = ClipboardSyncThread(
-                self.ssh, log_callback=self._thread_log)
-            self._clip_thread.start()
-
-    def _type_docker_setup(self):
-        """Печатать в KiTTY блок установки docker + контейнера chrome.
-
-        Строки отправляются по одной с Enter в конце — так каждая команда
-        выполняется отдельно (как если бы пользователь вводил её вручную).
-        Возвращает True, если все строки отправлены.
-        """
-        if not self._kitty:
-            self._log("❌ KiTTY не запущен", "error")
-            return False
-        self._kitty.restore_window()
-        for line in DOCKER_SETUP_BLOCK.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            ok, msg = self._kitty.send_command(line)
-            if not ok:
-                self._log("❌ KiTTY: не удалось отправить команду: {}".format(
-                    msg), "error")
-                return False
-            time.sleep(0.1)
-        return True
-
-    def _stop_clipboard_sync(self):
-        """Остановить синхронизацию буфера обмена."""
-        if self._clip_thread and self._clip_thread.is_alive():
-            try:
-                self._clip_thread.stop()
-            except Exception:
-                pass
-        self._clip_thread = None
 
     # ================= прочее =================
 

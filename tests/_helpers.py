@@ -59,7 +59,7 @@ class FakeSSH:
         self._responses = list(responses or [])
         self.client = FakeShellClient()
 
-    def execute_command(self, command):
+    def execute_command(self, command, timeout=None):
         self.commands.append(command)
         if self._responses:
             return self._responses.pop(0)

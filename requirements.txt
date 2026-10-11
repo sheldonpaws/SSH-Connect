@@ -1,6 +1,8 @@
 paramiko==5.0.0
 pyinstaller==6.21.0
 cryptography==50.0.0
+
+# Только для find_window_class.py (отладочная утилита, в сборку не входит).
+# Само приложение и move_cursor.py работают на чистом ctypes.
 pywin32==312
 psutil==7.2.2
-python-xlib==0.33

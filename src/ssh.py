@@ -68,13 +68,20 @@ class SSHClient:
         except Exception as e:
             return False, str(e)
 
-    def execute_command(self, command: str) -> Tuple[bool, str]:
-        """Выполнение команды"""
+    def execute_command(self, command: str,
+                        timeout=None) -> Tuple[bool, str]:
+        """Выполнение команды.
+
+        timeout (сек) ограничивает открытие канала И ожидание вывода — без
+        него зависший на сервере процесс подвешивал навсегда фоновую
+        проверку в GUI.
+        """
         if not self.is_connected or not self.client:
             return False, "Нет подключения"
 
         try:
-            stdin, stdout, stderr = self.client.exec_command(command)
+            stdin, stdout, stderr = self.client.exec_command(
+                command, timeout=timeout)
             output = stdout.read().decode('utf-8', errors='replace')
             error = stderr.read().decode('utf-8', errors='replace')
             exit_status = stdout.channel.recv_exit_status()

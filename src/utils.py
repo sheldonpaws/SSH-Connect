@@ -5,14 +5,8 @@
 import json
 import os
 from typing import Dict
-from datetime import datetime
 
 from src.encryption import encrypt_field, decrypt_field
-
-
-def get_timestamp() -> str:
-    """Получить текущее время в формате ЧЧ:ММ:СС"""
-    return datetime.now().strftime("%H:%M:%S")
 
 
 def load_connections(filepath: str) -> Dict:
@@ -61,8 +55,3 @@ def save_connections(filepath: str, connections: Dict) -> bool:
     except Exception as e:
         print(f"Ошибка сохранения подключений: {e}")
         return False
-
-
-def format_remote_path(home_dir: str, filename: str) -> str:
-    """Формирование полного пути на сервере"""
-    return f"{home_dir}/{filename}"

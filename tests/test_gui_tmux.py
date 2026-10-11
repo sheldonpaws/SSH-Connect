@@ -15,7 +15,7 @@ class FakeSSH:
         self.is_connected = True
         self._result = result
 
-    def execute_command(self, command):
+    def execute_command(self, command, timeout=None):
         return self._result
 
 

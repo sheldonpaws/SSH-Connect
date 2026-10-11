@@ -84,7 +84,7 @@ class TestWebAuth(unittest.TestCase):
         self.assertEqual(result, "NEXT")
 
     def test_non_api_path_is_open(self):
-        self.assertEqual(self._call("GET", "/hermes"), "NEXT")
+        self.assertEqual(self._call("GET", "/index.html"), "NEXT")
 
     def test_resource_path_frontend_exists(self):
         frontend = webmain._resource_path("frontend")

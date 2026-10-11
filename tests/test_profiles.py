@@ -60,12 +60,6 @@ class TestProfiles(unittest.TestCase):
             f.write("{not json")
         self.assertEqual(utils.load_connections(self.path), {})
 
-    def test_get_timestamp_format(self):
-        self.assertRegex(utils.get_timestamp(), r"^\d{2}:\d{2}:\d{2}$")
-
-    def test_format_remote_path(self):
-        self.assertEqual(utils.format_remote_path("/home/u", "a.txt"), "/home/u/a.txt")
-
 
 if __name__ == "__main__":
     unittest.main()

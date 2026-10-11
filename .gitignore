@@ -228,6 +228,8 @@ SshHostKeys/
 web-desktop/backend/.server_token
 web-desktop/backend/server.log
 web-desktop/backend/server.log.err
+web-desktop/backend/out.txt
+web-desktop/backend/err.txt
 ошибки.txt
 
 # Per-machine runtime/state (auto-created, never push)

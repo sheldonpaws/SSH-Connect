@@ -30,7 +30,7 @@ class TestSkillContent(unittest.TestCase):
 
 
 class _RaisingSSH(FakeSSH):
-    def execute_command(self, command):
+    def execute_command(self, command, timeout=None):
         raise RuntimeError("network down")
 
 

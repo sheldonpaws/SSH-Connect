@@ -61,12 +61,20 @@ class SSHSession:
         self.running = False
         self.callbacks = []
         self.hostname: Optional[str] = None
+        # Данные профиля подключения — нужны, например, для sudo (docker).
+        # Хранятся только в памяти сессии, в ответы API не попадают.
+        self.username: Optional[str] = None
+        self.port: Optional[int] = None
+        self.password: Optional[str] = None
 
     def connect(self, hostname: str, port: int, username: str,
                 password: Optional[str] = None, key_file: Optional[str] = None) -> tuple[bool, str]:
         """Подключение к серверу"""
         try:
             self.hostname = hostname
+            self.username = username
+            self.port = port
+            self.password = password
             self.client = paramiko.SSHClient()
             _prepare_host_keys(self.client)
 
