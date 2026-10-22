@@ -36,6 +36,16 @@
         });
     }
 
+    // Кнопка «Hermes»: бэкенд поднимает локальный мост (порт 9120) к дашборду
+    // Hermes на VPS через живую SSH-сессию — никаких ручных тоннелей KiTTY.
+    const hermesLink = document.getElementById('hermes-link');
+    if (hermesLink) {
+        hermesLink.addEventListener('click', (e) => {
+            e.preventDefault();
+            openHermes();
+        });
+    }
+
     // Убираем токен из адресной строки (не светить в истории браузера).
     try {
         window.history.replaceState({}, document.title, window.location.pathname);
@@ -116,6 +126,32 @@
             showToast('❌ ' + (err && err.message ? err.message : err), 'error');
         } finally {
             dockerBusy = false;
+        }
+    }
+
+    // === Hermes-дашборд ===
+    // Бэкенд поднимает локальный мост (127.0.0.1:9120) к дашборду на VPS
+    // (127.0.0.1:9119) через живую SSH-сессию. Повторное нажатие, если мост
+    // уже поднят, просто открывает страницу заново.
+    let hermesBusy = false;
+    async function openHermes() {
+        if (hermesBusy) return;
+        hermesBusy = true;
+        try {
+            const start = await api('/api/hermes/start', {
+                method: 'POST',
+                body: { session_id: sessionId },
+            });
+            if (!start.success) {
+                showToast(start.error || 'Не удалось поднять мост к Hermes', 'error');
+                return;
+            }
+            window.open(start.url, '_blank');
+            showToast('🧠 Открываю дашборд Hermes', 'success');
+        } catch (err) {
+            showToast('❌ ' + (err && err.message ? err.message : err), 'error');
+        } finally {
+            hermesBusy = false;
         }
     }
 

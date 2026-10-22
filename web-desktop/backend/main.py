@@ -20,9 +20,14 @@ import uvicorn
 from ssh_manager import SSHSession
 from file_manager import FileManager
 import docker_manager
+import hermes_bridge
 
 sessions: dict[str, SSHSession] = {}
 auth_tokens: dict[str, str] = {}
+
+# Мост к дашборду Hermes (порт 9119 на VPS). Один на процесс бэкенда:
+# поднимается по кнопке «Hermes» в тулбаре, живёт, пока открыта программа.
+hermes: hermes_bridge.HermesBridge | None = None
 
 SERVER_TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.server_token')
 
@@ -51,6 +56,8 @@ async def lifespan(app: FastAPI):
     """Запуск и остановка сервера"""
     print('SSH Connect Web server started!')
     yield
+    if hermes is not None:
+        hermes.stop()
     for session in sessions.values():
         session.close()
     sessions.clear()
@@ -230,6 +237,9 @@ async def connect(req: ConnectRequest):
 async def disconnect(session_id: str):
     """Закрытие SSH-подключения"""
     if session_id in sessions:
+        if hermes is not None and hermes.session_id == session_id:
+            hermes.stop()
+            globals()['hermes'] = None
         sessions[session_id].close()
         del sessions[session_id]
         auth_tokens.pop(session_id, None)
@@ -412,17 +422,69 @@ async def tmux_sessions(req: FileListRequest):
 
 @app.post('/api/docker/start')
 async def docker_start(req: DockerRequest):
-    """«Docker-браузер»: проверить готовность и открыть либо выдать команды.
+    """«Docker-браузер»: проверить готовность и открыть либо сообщить об отсутствии.
 
-    Бэкенд НИЧЕГО не устанавливает сам: если docker + контейнер `chrome` уже
-    есть — отдаём адрес `https://<хост>:3001`; если нет — отдаём список команд
-    ручной установки, пользователь выполняет их на сервере и жмёт повторно.
+    Бэкенд НИЧЕГО не устанавливает сам и команд не отдаёт: если docker +
+    контейнер `chrome` уже есть — отдаём адрес `https://<хост>:3001`; если нет —
+    `state: 'install'`, а команды установки пользователь берёт из своей
+    документации и выполняет их вручную в KiTTY, потом жмёт повторно.
     """
     session = _require_session(req.session_id)
-    if docker_manager.check_ready(session.client):
+    try:
+        ready = docker_manager.check_ready(session.client)
+    except Exception as exc:  # SSH-сбой не должен ронять роут в HTTP 500
+        return {'success': False,
+                'error': 'Не удалось проверить Docker на сервере: {}'.format(exc)}
+    if ready:
         return {'success': True, 'state': 'ready', 'url': docker_manager.browser_url(session.hostname)}
-    return {'success': True, 'state': 'install',
-            'commands': docker_manager.DOCKER_SETUP_COMMANDS}
+    return {'success': True, 'state': 'install'}
+
+
+class HermesStartRequest(BaseModel):
+    session_id: str
+
+
+@app.post('/api/hermes/start')
+async def hermes_start(req: HermesStartRequest):
+    """«Hermes»: поднять локальный мост к дашборду Hermes (VPS 127.0.0.1:9119).
+
+    Мост слушает только 127.0.0.1 на этом ПК (порт 9120) и идёт через ЖИВУЮ
+    SSH-сессию (paramiko direct-tcpip) — ручные тоннели KiTTY не нужны.
+    Повторный вызов, если мост уже поднят и его транспорт жив, возвращает
+    тот же адрес без пересоздания.
+    """
+    global hermes
+    session = _require_session(req.session_id)
+    transport = session.client.get_transport() if session.client else None
+    if transport is None or not transport.is_active():
+        return {'success': False, 'error': 'SSH-соединение неактивно — переподключитесь'}
+    if hermes is not None and hermes.running:
+        # Перевязать мост на свежую сессию, если пользователь переподключался.
+        if not (hermes.transport is transport):
+            hermes.stop()
+        else:
+            return {'success': True, 'url': hermes.url}
+    bridge = hermes_bridge.HermesBridge(transport)
+    try:
+        bridge.start()
+    except OSError as e:
+        return {'success': False, 'error': f'Не удалось открыть порт {bridge.listen_port}: {e}'}
+    except Exception as e:
+        return {'success': False, 'error': f'Мост не поднялся: {e}'}
+    bridge.session_id = req.session_id
+    hermes = bridge
+    return {'success': True, 'url': bridge.url}
+
+
+@app.post('/api/hermes/stop')
+async def hermes_stop(req: HermesStartRequest):
+    """Остановить мост (кнопка тоггл / отключение сессии)."""
+    global hermes
+    if hermes is not None and (not req.session_id or hermes.session_id == req.session_id):
+        hermes.stop()
+        hermes = None
+        return {'success': True, 'message': 'Мост остановлен'}
+    return {'success': True, 'message': 'Мост не запущен'}
 
 
 KITTY_LOG_FILE = os.path.join(tempfile.gettempdir(), 'kitty_session.log')

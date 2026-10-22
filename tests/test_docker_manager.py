@@ -2,7 +2,17 @@
 """Тесты Docker-браузера (web-desktop/backend/docker_manager.py).
 
 Без сети/сервера: SSH-клиент подменяется фейком. Проверяем, что бэкенд только
-ПРОВЕРЯЕТ готовность и отдаёт команды ручной установки, ничего не ставя сам.
+ПРОВЕРЯЕТ готовность, ничего не ставя и не отдавая команд установки — их
+пользователь берёт из своей документации и выполняет вручную в KiTTY.
+
+Регрессии, которые уже случались на этом коде (не переписывать вслепую):
+  * `grep -q` в DOCKER_CHECK_COMMAND — флаг глушит stdout, а check_ready
+    решает по содержимому stdout → проверка всегда False при живом docker;
+  * `docker ps -a` без `--format` печатает строки таблицы целиком, поэтому
+    `grep -x chrome` никогда не совпадёт — имя контейнера выдаёт только
+    `--format '{{.Names}}'`;
+  * ссылка на удалённую константу DOCKER_SETUP_COMMANDS в main.py роняла
+    роут с AttributeError → HTTP 500.
 """
 
 import os
@@ -58,29 +68,18 @@ class TestDockerCommands(unittest.TestCase):
         self.assertIn(dm.DOCKER_BROWSER_READY, dm.DOCKER_CHECK_COMMAND)
         self.assertNotIn("sudo", dm.DOCKER_CHECK_COMMAND)
 
-    def test_setup_commands_add_docker_repo(self):
-        """docker-ce нет в штатных репозиториях Ubuntu — репозиторий обязателен."""
-        joined = "\n".join(dm.DOCKER_SETUP_COMMANDS)
-        self.assertIn("download.docker.com", joined)
-        self.assertIn("/etc/apt/keyrings", joined)
-        self.assertIn("docker.list", joined)
-        self.assertIn("apt-get install -y docker-ce", joined)
+    def test_check_command_must_print_match(self):
+        """check_ready решает по stdout → команда обязана ПЕЧАТАТЬ совпадение.
 
-    def test_setup_commands_run_chrome(self):
-        joined = "\n".join(dm.DOCKER_SETUP_COMMANDS)
-        self.assertIn("--name=chrome", joined)
-        self.assertIn("lscr.io/linuxserver/chrome:latest", joined)
-        self.assertIn("systemctl enable --now docker", joined)
-        self.assertIn("{}:{}".format(dm.DOCKER_PORT, dm.DOCKER_PORT), joined)
-
-    def test_setup_commands_no_password(self):
-        for cmd in dm.DOCKER_SETUP_COMMANDS:
-            self.assertNotIn("password", cmd.lower())
-            self.assertNotIn("secret", cmd)
-
-    def test_setup_block_joins_commands(self):
-        for cmd in dm.DOCKER_SETUP_COMMANDS:
-            self.assertIn(cmd, dm.DOCKER_SETUP_BLOCK)
+        `grep -q` запрещён (глушит вывод), имя контейнера добирается только
+        через `--format '{{.Names}}'` — строка таблицы `docker ps -a` целиком
+        с `grep -x` не совпадает никогда.
+        """
+        cmd = dm.DOCKER_CHECK_COMMAND
+        self.assertNotIn("grep -q", cmd)
+        self.assertIn("--format", cmd)
+        self.assertIn("{{.Names}}", cmd)
+        self.assertIn("grep -x", cmd)
 
     def test_port_constant(self):
         self.assertEqual(dm.DOCKER_PORT, 3001)
@@ -110,11 +109,15 @@ class TestCheckReady(unittest.TestCase):
 
 
 class TestNoAutoInstall(unittest.TestCase):
-    """Регресс: бэкенд не должен уметь ставить docker сам."""
+    """Регресс: бэкенд не должен уметь ставить docker сам и отдавать команды.
+
+    Команды установки пользователь выполняет вручную по своей документации.
+    """
 
     def test_no_install_or_job_api(self):
         for name in ("DockerJob", "start_job", "get_job", "drop_session",
-                     "DOCKER_INSTALL_COMMAND"):
+                     "DOCKER_INSTALL_COMMAND", "DOCKER_SETUP_COMMANDS",
+                     "DOCKER_SETUP_BLOCK"):
             self.assertFalse(hasattr(dm, name), name)
 
 
