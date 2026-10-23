@@ -206,6 +206,7 @@ and don't waste disk. Cleanup is part of the PUT workflow, not optional.
 - **The root mount set is NOT stable across re-opens.** SSH-Connect serves whichever folder the user last pointed the tunnel at; stopping and re-opening can swap the whole tree (e.g. `/` listed `fangunion`+`ai-dream-agents` one session, then only `barklay-ofice` the next). Re-`curl http://127.0.0.1:17850/` every session and re-read the listing before assuming a previously-seen project is still reachable — do not trust last session's mounts.
 - **Tunnel down fingerprint:** a `curl` to `127.0.0.1:17850` returning exit code 7 ("failed to connect") means the tunnel is currently down. Cover it with a one-liner `curl -s --max-time 5 ...; echo exit $?` to give the user a definitive up/down verdict instead of an ambiguous empty body.
 - **A drop mid-PUT leaves the file unchanged — report nothing as done on a failed write.** The user often closes/re-opens the SSH-Connect client mid-session ("забыл открыть доступ"); a PUT that hits a dropped tunnel fails with ConnectionRefused (exit 11/7) and NOTHING is written — the on-disk file stays the old version. Re-probe (`curl ...; echo exit $?`) before you PUT and again before you claim success; never tell the user a change landed on a refused PUT.
+- **An exception raised DURING a large PUT is not proof the write failed — verify with GET.** Measured 2026-10-23: an 80 MB PUT raised `RemoteDisconnected` after ~60 s, yet `GET` returned all 84,150,988 bytes and the zip passed CRC (`testzip()` → None); a 16 MB PUT failed at 10 s and succeeded on retry at 24 s; a 4 MB PUT never failed. The flakiness is duration/load-related, not a hard size cap. Therefore: chunk payloads to ~4–8 MB so each request stays short, retry `ConnectionError` twice, and confirm EVERY write by GET (byte count / sha256 / UTF-8 decode) before reporting it — in both directions, success and failure. `ConnectionRefused` before the request is the exception: then genuinely nothing was written.
 - **Do not trust a /tmp-prepared file across a tunnel drop.** Content you staged while the tunnel was down can be cleaned from /tmp before access returns. When the tunnel comes back, re-fetch the source fresh and re-apply a self-contained patch (assert each needle before PUT) rather than PUTting a saved /tmp copy whose needles may no longer match.
 - Local listeners on common ports (8000 dashboard, 3001 nginx, 17850 agent, 41343 model server) masquerade as tunnel forwards. Always resolve the owning process before concluding. Port **17850** IS the SSH-Connect reverse tunnel when the reverse_access.json manifest points there.
  - Cyrillic file content may appear as mojibake via Python requests without proper encoding.
@@ -215,6 +216,26 @@ and don't waste disk. Cleanup is part of the PUT workflow, not optional.
 
 Report, concretely: which IP dials in, how many ESTAB `:22` sessions, which ports are genuinely bound and by what process, and the specific sshd directive that blocks forwarding. Distinguish "tunnel is up" from "forwarded ports are up" — the former does not imply the latter.
 
+
+## Source of truth and generator
+
+The VPS copy (`~/.hermes/skills/devops/reverse-ssh-tunnel/SKILL.md`) is NOT the
+source of truth. The master lives in the SSH-Connect project:
+
+  `skills/reverse-ssh-tunnel.md`  — master (edit this)
+  `skills/gen_hermes_skills.py`    — reads the master, regenerates `src/hermes_skills.py`
+  `src/hermes_skills.py`           — generated output (string constant + install function)
+
+After editing this skill on VPS, propagate the change back to the master and
+run the generator:
+
+1. Edit `skills/reverse-ssh-tunnel.md` on Windows (via tunnel PUT).
+2. Run `python skills/gen_hermes_skills.py` from the project root on Windows.
+3. Verify: `python skills/gen_hermes_skills.py --check` (exit 0 = in sync).
+
+Skipping step 2 means the next clean VPS install gets the OLD version — the
+generator writes `src/hermes_skills.py` which is deployed by `install_skill_if_missing`
+during SSH connect.
 
 ## IMPORTANT: do NOT touch sshd when the tunnel already works
 
