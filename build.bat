@@ -81,7 +81,7 @@ robocopy "skills" "%DIST%\skills" /E /NFL /NDL /NJH /NJS /NP ^
     /XD __pycache__ /XF *.pyc >nul
 if errorlevel 8 goto :error
 
-for %%F in (kitty.exe kitty.ini move_cursor.py favicon.ico README.md LICENSE requirements.txt uninstall.cmd) do (
+for %%F in (kitty.exe kitty.ini move_cursor.py favicon.ico README.md LICENSE requirements.txt uninstall.cmd sshconnect-browser-install.sh puttygen.exe) do (
     if exist "%%F" copy /Y "%%F" "%DIST%\" >nul
 )
 if not exist "%DIST%\kitty.exe" (

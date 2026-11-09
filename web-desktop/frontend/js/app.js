@@ -26,16 +26,6 @@
     store.set('ssh_session', sessionId);
     store.set('ssh_token', authToken);
 
-    // Кнопка «Docker-браузер»: бэкенд проверяет/ставит docker + chrome на VPS,
-    // установка идёт фоном — опрашиваем статус, потом открываем страницу.
-    const dockerLink = document.getElementById('docker-link');
-    if (dockerLink) {
-        dockerLink.addEventListener('click', (e) => {
-            e.preventDefault();
-            openDocker();
-        });
-    }
-
     // Кнопка «Hermes»: бэкенд поднимает локальный мост (порт 9120) к дашборду
     // Hermes на VPS через живую SSH-сессию — никаких ручных тоннелей KiTTY.
     const hermesLink = document.getElementById('hermes-link');
@@ -43,6 +33,17 @@
         hermesLink.addEventListener('click', (e) => {
             e.preventDefault();
             openHermes();
+        });
+    }
+
+    // Кнопка «Браузер»: бэкенд поднимает на сервере sshconnect-browser
+    // (noVNC, только localhost) и локальный проброс 3001 через живую
+    // SSH-сессию — картинка идёт по SSH, порты наружу не открыты.
+    const browserLink = document.getElementById('browser-link');
+    if (browserLink) {
+        browserLink.addEventListener('click', (e) => {
+            e.preventDefault();
+            openBrowser();
         });
     }
 
@@ -99,36 +100,6 @@
         toastTimer = setTimeout(() => toastEl.classList.add('hidden'), 3000);
     }
 
-    // === Docker-браузер ===
-    // Бэкенд ничего не устанавливает: если docker + контейнер chrome на сервере
-    // уже есть — открываем страницу, иначе просто сообщаем, что не установлено.
-    let dockerBusy = false;
-
-    async function openDocker() {
-        if (dockerBusy) return;
-        dockerBusy = true;
-        try {
-            const start = await api('/api/docker/start', {
-                method: 'POST',
-                body: { session_id: sessionId },
-            });
-            if (!start.success) {
-                showToast(start.error || 'Не удалось проверить Docker-браузер', 'error');
-                return;
-            }
-            if (start.state === 'ready' && start.url) {
-                window.open(start.url, '_blank');
-                showToast('🐳 Открываю Docker-браузер', 'success');
-                return;
-            }
-            showToast('Docker-браузер не установлен на сервере', 'error');
-        } catch (err) {
-            showToast('❌ ' + (err && err.message ? err.message : err), 'error');
-        } finally {
-            dockerBusy = false;
-        }
-    }
-
     // === Hermes-дашборд ===
     // Бэкенд поднимает локальный мост (127.0.0.1:9120) к дашборду на VPS
     // (127.0.0.1:9119) через живую SSH-сессию. Повторное нажатие, если мост
@@ -152,6 +123,29 @@
             showToast('❌ ' + (err && err.message ? err.message : err), 'error');
         } finally {
             hermesBusy = false;
+        }
+    }
+
+    // === Веб-браузер на сервере ===
+    let browserBusy = false;
+    async function openBrowser() {
+        if (browserBusy) return;
+        browserBusy = true;
+        try {
+            const start = await api('/api/browser/start', {
+                method: 'POST',
+                body: { session_id: sessionId },
+            });
+            if (!start.success) {
+                showToast(start.error || 'Не удалось запустить браузер на сервере', 'error');
+                return;
+            }
+            window.open(start.url, '_blank');
+            showToast('🌐 Открываю браузер сервера', 'success');
+        } catch (err) {
+            showToast('❌ ' + (err && err.message ? err.message : err), 'error');
+        } finally {
+            browserBusy = false;
         }
     }
 

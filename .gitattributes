@@ -1,0 +1,3 @@
+# cmd разбирает LF-файлы как мусор — .bat/.cmd всегда с CRLF при чекауте
+*.bat text eol=crlf
+*.cmd text eol=crlf

@@ -297,7 +297,17 @@ class KittyController:
         if hostkey:
             args += ["-hostkey", hostkey]
         if key_file:
-            args += ["-i", key_file]
+            # KiTTY (PuTTY 0.76) читает ТОЛЬКО формат .ppk, а GUI-сессия
+            # (paramiko) — OpenSSH. Если в поле указан OpenSSH-ключ, а рядом
+            # лежит его .ppk-версия (id_ed25519.ppk) — отдаём в KiTTY .ppk;
+            # без .ppk -i не передаём, чтобы KiTTY не показывал ошибку
+            # формата и шёл по паролю (пароль GUI передаёт отдельно).
+            kitty_key = key_file
+            if not key_file.lower().endswith(".ppk"):
+                sibling = key_file + ".ppk"
+                kitty_key = sibling if os.path.isfile(sibling) else None
+            if kitty_key:
+                args += ["-i", kitty_key]
 
         try:
             self.process = subprocess.Popen(

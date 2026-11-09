@@ -1,6 +1,5 @@
 """SSH Connect Web — веб-интерфейс для сервера:
-REST API файлов + меню установленных программ (запуск в KiTTY)
-+ Docker-браузер.
+REST API файлов + меню установленных программ (запуск в KiTTY).
 """
 import os
 import secrets
@@ -19,7 +18,6 @@ import uvicorn
 
 from ssh_manager import SSHSession
 from file_manager import FileManager
-import docker_manager
 import hermes_bridge
 
 sessions: dict[str, SSHSession] = {}
@@ -28,6 +26,9 @@ auth_tokens: dict[str, str] = {}
 # Мост к дашборду Hermes (порт 9119 на VPS). Один на процесс бэкенда:
 # поднимается по кнопке «Hermes» в тулбаре, живёт, пока открыта программа.
 hermes: hermes_bridge.HermesBridge | None = None
+# Мост к веб-браузеру на сервере (noVNC, серверный 127.0.0.1:6080). Поднимется
+# по кнопке «🌐 Браузер» в веб-интерфейсе; локальный проброс — порт 3001.
+browser: hermes_bridge.HermesBridge | None = None
 
 SERVER_TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.server_token')
 
@@ -58,6 +59,8 @@ async def lifespan(app: FastAPI):
     yield
     if hermes is not None:
         hermes.stop()
+    if browser is not None:
+        browser.stop()
     for session in sessions.values():
         session.close()
     sessions.clear()
@@ -192,10 +195,6 @@ class LaunchRequest(BaseModel):
     command: str
 
 
-class DockerRequest(BaseModel):
-    session_id: str
-
-
 class KittyLogRequest(BaseModel):
     session_id: str
     offset: int = 0
@@ -240,6 +239,9 @@ async def disconnect(session_id: str):
         if hermes is not None and hermes.session_id == session_id:
             hermes.stop()
             globals()['hermes'] = None
+        if browser is not None and browser.session_id == session_id:
+            browser.stop()
+            globals()['browser'] = None
         sessions[session_id].close()
         del sessions[session_id]
         auth_tokens.pop(session_id, None)
@@ -420,26 +422,6 @@ async def tmux_sessions(req: FileListRequest):
     return {'success': True, 'sessions': names, 'running': bool(names)}
 
 
-@app.post('/api/docker/start')
-async def docker_start(req: DockerRequest):
-    """«Docker-браузер»: проверить готовность и открыть либо сообщить об отсутствии.
-
-    Бэкенд НИЧЕГО не устанавливает сам и команд не отдаёт: если docker +
-    контейнер `chrome` уже есть — отдаём адрес `https://<хост>:3001`; если нет —
-    `state: 'install'`, а команды установки пользователь берёт из своей
-    документации и выполняет их вручную в KiTTY, потом жмёт повторно.
-    """
-    session = _require_session(req.session_id)
-    try:
-        ready = docker_manager.check_ready(session.client)
-    except Exception as exc:  # SSH-сбой не должен ронять роут в HTTP 500
-        return {'success': False,
-                'error': 'Не удалось проверить Docker на сервере: {}'.format(exc)}
-    if ready:
-        return {'success': True, 'state': 'ready', 'url': docker_manager.browser_url(session.hostname)}
-    return {'success': True, 'state': 'install'}
-
-
 class HermesStartRequest(BaseModel):
     session_id: str
 
@@ -483,6 +465,93 @@ async def hermes_stop(req: HermesStartRequest):
     if hermes is not None and (not req.session_id or hermes.session_id == req.session_id):
         hermes.stop()
         hermes = None
+        return {'success': True, 'message': 'Мост остановлен'}
+    return {'success': True, 'message': 'Мост не запущен'}
+
+
+BROWSER_SERVICE = 'sshconnect-browser.service'
+BROWSER_VNC_PATH = ('/vnc.html?autoconnect=1&resize=scale'
+                    '&reconnect=true')
+
+
+def _browser_service_up(session_id: str):
+    """Поднять sshconnect-browser на сервере и дождаться его веб-интерфейса.
+
+    Сервис ставит скрипт sshconnect-browser-install.sh: слушает только
+    127.0.0.1:6080, в автозагрузку не включён (старт по кнопке). root запускает
+    напрямую, sheldon — через sudo NOPASSWD (запись создаёт тот же скрипт).
+    Возвращает (ok, текст_ошибки).
+    """
+    ok, out = _exec_on_session(session_id,
+                               'systemctl is-active ' + BROWSER_SERVICE + ' 2>&1',
+                               timeout=15)
+    if ok and out.strip().startswith('active'):
+        return True, ''
+    cmd = ('sudo -n systemctl start ' + BROWSER_SERVICE +
+           ' 2>/dev/null || systemctl start ' + BROWSER_SERVICE + ' 2>&1')
+    ok, out = _exec_on_session(session_id, cmd, timeout=30)
+    if not ok:
+        text = (out or '').strip()
+        if 'not found' in text or 'No such file' in text:
+            return False, ('Браузер не установлен на сервере — запусти '
+                           'sshconnect-browser-install.sh (см. документацию)')
+        return False, ('Не удалось запустить браузер на сервере: '
+                       + text[:200])
+    # Xvfb, fluxbox и chrome поднимаются секунды — ждём, пока noVNC ответит.
+    cmd = ('for i in $(seq 1 15); do curl -s -o /dev/null -m 1 '
+           'http://127.0.0.1:6080/vnc.html && exit 0; sleep 1; done; exit 1')
+    ok, _ = _exec_on_session(session_id, cmd, timeout=30)
+    if not ok:
+        return False, 'Браузер запущен, но noVNC не ответил за 15 секунд'
+    return True, ''
+
+
+@app.post('/api/browser/start')
+async def browser_start(req: HermesStartRequest):
+    """«🌐 Браузер»: поднять на сервере браузер (noVNC) и открыть его вкладкой.
+
+    На сервере панель слушает ТОЛЬКО 127.0.0.1 (урок инцидента: панель на
+    0.0.0.0 без пароля). Картинка идёт по SSH: локальный мост 127.0.0.1:3001
+    -> серверный 127.0.0.1:6080 через direct-tcpip живой сессии. Повторный
+    вызов при живом мосте возвращает тот же адрес.
+    """
+    global browser
+    session = _require_session(req.session_id)
+    transport = session.client.get_transport() if session.client else None
+    if transport is None or not transport.is_active():
+        return {'success': False,
+                'error': 'SSH-соединение неактивно — переподключитесь'}
+    up, err = _browser_service_up(req.session_id)
+    if not up:
+        return {'success': False, 'error': err}
+    if browser is not None and browser.running:
+        if not (browser.transport is transport):
+            browser.stop()  # переподключились — перевязываем на свежий транспорт
+        else:
+            return {'success': True,
+                    'url': browser.url + BROWSER_VNC_PATH}
+    bridge = hermes_bridge.HermesBridge(
+        transport, listen_port=3001, target=('127.0.0.1', 6080))
+    try:
+        bridge.start()
+    except OSError as e:
+        return {'success': False,
+                'error': 'Не удалось открыть порт 3001: {}'.format(e)}
+    except Exception as e:
+        return {'success': False, 'error': 'Мост не поднялся: {}'.format(e)}
+    bridge.session_id = req.session_id
+    browser = bridge
+    return {'success': True, 'url': bridge.url + BROWSER_VNC_PATH}
+
+
+@app.post('/api/browser/stop')
+async def browser_stop(req: HermesStartRequest):
+    """Остановить локальный мост (серверный сервис не гасим — он дешёвый)."""
+    global browser
+    if browser is not None and (not req.session_id
+                                or browser.session_id == req.session_id):
+        browser.stop()
+        browser = None
         return {'success': True, 'message': 'Мост остановлен'}
     return {'success': True, 'message': 'Мост не запущен'}
 

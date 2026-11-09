@@ -15,7 +15,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _bootstrap import BACKEND, ROOT  # noqa: E402,F401
 
 import main as webmain  # noqa: E402
-import docker_manager  # noqa: E402
 
 
 def _call(coro):
@@ -57,14 +56,24 @@ class TestRoutesRegistered(unittest.TestCase):
             ('/api/files/download', 'POST'),
             ('/api/programs', 'POST'),
             ('/api/launch', 'POST'),
-            ('/api/docker/start', 'POST'),
         ]:
             self.assertIn((path, method), present, path)
 
-    def test_no_hermes_routes_left(self):
-        """Hermes удалён из проекта — его эндпоинтов быть не должно."""
+    def test_no_hermes_chat_routes_left(self):
+        """Веб-чат Hermes удалён из проекта — его роутов быть не должно.
+
+        Мост /api/hermes/start|stop (кнопка «🧠 Hermes», 21.10) легитимен,
+        поэтому проверяется только отсутствие роутов ЧАТА (hermes_manager).
+        """
         paths = [r.path for r in webmain.app.routes if hasattr(r, 'path')]
-        self.assertFalse([p for p in paths if 'hermes' in p])
+        chat = [p for p in paths if 'hermes' in p and p not in
+                ('/api/hermes/start', '/api/hermes/stop')]
+        self.assertFalse(chat)
+
+    def test_no_docker_routes_left(self):
+        """Docker-браузер удалён (инцидент 2026-11) — docker-роутов быть не должно."""
+        paths = [r.path for r in webmain.app.routes if hasattr(r, 'path')]
+        self.assertFalse([p for p in paths if 'docker' in p])
 
 
 class TestFrontendAuthParams(unittest.TestCase):
@@ -97,68 +106,11 @@ class TestSessionGuards(unittest.TestCase):
         from fastapi import HTTPException
         for coro in (
             webmain.file_list(webmain.FileListRequest(session_id='nope')),
-            webmain.docker_start(webmain.DockerRequest(session_id='nope')),
         ):
             with self.assertRaises(HTTPException) as ctx:
                 _call(coro)
             self.assertEqual(ctx.exception.status_code, 404)
 
-
-class _DockerClient:
-    """SSH-клиент, отвечающий на проверку docker фиксированным выводом."""
-
-    def __init__(self, output):
-        self.output = output
-        self.commands = []
-
-    def exec_command(self, command, timeout=None):
-        self.commands.append(command)
-
-        class _Out:
-            def __init__(self, data):
-                self._data = data.encode('utf-8')
-                self._pos = 0
-
-            def read(self, n):
-                chunk = self._data[self._pos:self._pos + n]
-                self._pos += len(chunk)
-                return chunk
-
-        return None, _Out(self.output), None
-
-
-class TestDockerRoutes(unittest.TestCase):
-    def setUp(self):
-        webmain.sessions.clear()
-        self.addCleanup(webmain.sessions.clear)
-
-    def test_install_when_missing(self):
-        sess = _FakeSession('s1')
-        sess.client = _DockerClient(docker_manager.DOCKER_BROWSER_MISSING)
-        webmain.sessions['s1'] = sess
-        data = _call(webmain.docker_start(webmain.DockerRequest(session_id='s1')))
-        self.assertTrue(data['success'])
-        self.assertEqual(data['state'], 'install')
-        self.assertEqual(data['commands'], docker_manager.DOCKER_SETUP_COMMANDS)
-
-    def test_ready_returns_url(self):
-        sess = _FakeSession('s1', hostname='vps.my')
-        sess.client = _DockerClient(docker_manager.DOCKER_BROWSER_READY)
-        webmain.sessions['s1'] = sess
-        data = _call(webmain.docker_start(webmain.DockerRequest(session_id='s1')))
-        self.assertTrue(data['success'])
-        self.assertEqual(data['state'], 'ready')
-        self.assertEqual(data['url'], 'https://vps.my:3001')
-
-    def test_no_auto_install_side_effects(self):
-        """Проверка лишь читает — никаких sudo/установки в потоке команд."""
-        sess = _FakeSession('s1')
-        client = _DockerClient(docker_manager.DOCKER_BROWSER_MISSING)
-        sess.client = client
-        webmain.sessions['s1'] = sess
-        _call(webmain.docker_start(webmain.DockerRequest(session_id='s1')))
-        self.assertEqual(len(client.commands), 1)
-        self.assertNotIn('sudo', client.commands[0])
 
 
 class TestDownloadGuards(unittest.TestCase):

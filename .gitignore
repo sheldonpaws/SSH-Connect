@@ -239,3 +239,12 @@ move_cursor.log
 tunnel_config.json
 TUNNEL_LOG.md
 Ошибка.txt
+
+# Local-only / generated (added 06.11.26)
+*.orig-*
+SSH_env/
+Output/
+Proxies/
+Скриншот*.png
+UTF8
+build.bat
